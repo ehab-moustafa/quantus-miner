@@ -52,7 +52,7 @@ async fn run() {
     let kernel_source = std::env::args()
         .nth(1)
         .map(|path| std::fs::read_to_string(path).expect("read kernel source"))
-        .unwrap_or_else(|| engine_gpu::Kernel::Apple.source().to_owned());
+        .unwrap_or_else(|| engine_gpu::Kernel::Apple.mining_source().to_string());
     let source = format!(
         r#"{}
 @group(0) @binding(5) var<storage, read> pairs: array<u64>;

@@ -37,7 +37,8 @@ struct GpuResources {
     start_nonce_buffer: wgpu::Buffer,
     results_buffer: wgpu::Buffer,
     dispatch_config_buffer: wgpu::Buffer,
-    staging_buffer: wgpu::Buffer,
+    /// Ping-pong readback buffers so batch N+1 can copy while N is mapped.
+    staging_buffers: [wgpu::Buffer; 2],
     bind_group: wgpu::BindGroup,
 }
 
@@ -109,12 +110,20 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Staging Buffer"),
-            size: results_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let staging_buffers = [
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Staging Buffer A"),
+                size: results_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Staging Buffer B"),
+                size: results_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        ];
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Mining Bind Group"),
@@ -149,10 +158,95 @@ impl GpuContext {
             start_nonce_buffer,
             results_buffer,
             dispatch_config_buffer,
-            staging_buffer,
+            staging_buffers,
             bind_group,
         }
     }
+}
+
+const RESULTS_SIZE: usize = (1 + 16 + 16) * 4;
+
+/// Dispatch geometry for one batch (used for submit and hash accounting).
+struct BatchDispatchParams {
+    num_workgroups: u32,
+    total_threads: u64,
+    nonces_per_thread: u32,
+    batch_size: u32,
+}
+
+/// Nonce count for one batch within a search range (256-bit nonce lane cap).
+fn batch_nonce_count(range_end: U512, batch_start: U512, max_batch: u32) -> u32 {
+    let remaining = range_end
+        .saturating_sub(batch_start)
+        .saturating_add(U512::one());
+    let headroom =
+        (U512::one() << 256) - (batch_start & ((U512::one() << 256) - U512::one()));
+    let cap = remaining.min(headroom);
+    let batch_size_u512 = U512::from(max_batch);
+    if cap > batch_size_u512 {
+        max_batch
+    } else {
+        cap.low_u32()
+    }
+}
+
+fn compute_batch_dispatch(gpu_ctx: &GpuContext, batch_size: u32) -> BatchDispatchParams {
+    let threads_per_workgroup = 256u32;
+    let limits = gpu_ctx.device.limits();
+    let max_workgroups = limits.max_compute_workgroups_per_dimension;
+
+    let hinted_workgroups = gpu_ctx.optimal_workgroups.max(1).min(max_workgroups);
+    let hinted_threads = hinted_workgroups as u64 * threads_per_workgroup as u64;
+
+    let logical_threads = (batch_size as u64).min(hinted_threads).max(1);
+    let num_workgroups = ((logical_threads as u32).div_ceil(threads_per_workgroup)).max(1);
+    let total_threads = (num_workgroups * threads_per_workgroup) as u64;
+    let nonces_per_thread = ((batch_size as u64).div_ceil(total_threads)).max(1) as u32;
+
+    BatchDispatchParams {
+        num_workgroups,
+        total_threads,
+        nonces_per_thread,
+        batch_size,
+    }
+}
+
+/// Upload midstate, nonce, and dispatch config for a batch (safe while staging map_async runs).
+fn write_batch_inputs(
+    gpu_ctx: &GpuContext,
+    resources: &GpuResources,
+    ctx: &JobContext,
+    batch_start: U512,
+    params: &BatchDispatchParams,
+) {
+    let skip_hit_early_out = std::env::var("MAC_SKIP_HIT_EARLY_OUT")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let dispatch_config = [
+        params.total_threads as u32,
+        params.nonces_per_thread,
+        params.batch_size,
+        u32::from(skip_hit_early_out),
+    ];
+    gpu_ctx.queue.write_buffer(
+        &resources.dispatch_config_buffer,
+        0,
+        bytemuck::cast_slice(&dispatch_config),
+    );
+
+    let start_nonce_bytes = batch_start.to_little_endian();
+    gpu_ctx
+        .queue
+        .write_buffer(&resources.start_nonce_buffer, 0, &start_nonce_bytes);
+
+    let nonce_be = batch_start.to_big_endian();
+    let midstate_u32s =
+        pow_core::mining_midstate_u32s(ctx.header, nonce_be[..32].try_into().unwrap());
+    gpu_ctx.queue.write_buffer(
+        &resources.midstate_buffer,
+        0,
+        bytemuck::cast_slice(&midstate_u32s),
+    );
 }
 
 /// Create the mining shader module without naga's runtime bounds checks and
@@ -422,7 +516,8 @@ impl GpuEngine {
                 kernel.label(),
                 kernel.id()
             );
-            let shader = create_trusted_shader(&device, kernel.source());
+            // Tier-X7: production init always uses create_shader_module_trusted (Apple included).
+            let shader = create_trusted_shader(&device, kernel.mining_source());
 
             let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Mining Pipeline"),
@@ -605,13 +700,12 @@ impl MinerEngine for GpuEngine {
             }
         });
 
-        // Pre-convert target (only needs to be done once per job)
-        let target_bytes = ctx.target.to_little_endian();
-        let mut target_u32s = [0u32; 16];
-        for i in 0..16 {
-            let chunk = &target_bytes[i * 4..(i + 1) * 4];
-            target_u32s[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
+        // Pre-convert target once per job (Apple: compare-ready u32 byte order).
+        let target_u32s = if gpu_ctx.input_usage.contains(wgpu::BufferUsages::UNIFORM) {
+            Kernel::Apple.job_target_u32s(ctx)
+        } else {
+            Kernel::Default.job_target_u32s(ctx)
+        };
         gpu_ctx.queue.write_buffer(
             &resources.target_buffer,
             0,
@@ -622,6 +716,9 @@ impl MinerEngine for GpuEngine {
         let mut total_hashes: u64 = 0;
         let mut current_start = range.start;
         let mut batch_num = 0u64;
+        let mut staging_ping: usize = 0;
+        // Inputs for current_start were queued during the previous batch's map poll.
+        let mut inputs_prequeued = false;
 
         log::info!(
             target: "gpu_engine",
@@ -652,27 +749,30 @@ impl MinerEngine for GpuEngine {
                 };
             }
 
-            // Calculate batch range. The batch is additionally clamped so nonce
-            // increments never carry into the high 256 bits, which the midstate
-            // precompute (and the kernels) rely on.
-            let remaining = range
-                .end
-                .saturating_sub(current_start)
-                .saturating_add(U512::one());
-            let headroom =
-                (U512::one() << 256) - (current_start & ((U512::one() << 256) - U512::one()));
-            let cap = remaining.min(headroom);
-            let batch_size_u512 = U512::from(self.batch_size);
-            let this_batch_size: u32 = if cap > batch_size_u512 {
-                self.batch_size
+            let this_batch_size =
+                batch_nonce_count(range.end, current_start, self.batch_size);
+
+            let next_start = current_start.saturating_add(U512::from(this_batch_size));
+            let next_batch = if next_start <= range.end {
+                let next_size = batch_nonce_count(range.end, next_start, self.batch_size);
+                Some((next_start, next_size))
             } else {
-                // cap fits in u32 since it's <= batch_size which is u32
-                cap.low_u32()
+                None
             };
 
             // Run single batch
-            let batch_result =
-                run_single_batch(gpu_ctx, &resources, ctx, current_start, this_batch_size);
+            let batch_result = run_single_batch(
+                gpu_ctx,
+                &resources,
+                ctx,
+                current_start,
+                this_batch_size,
+                staging_ping,
+                inputs_prequeued,
+                next_batch,
+            );
+            inputs_prequeued = next_batch.is_some();
+            staging_ping ^= 1;
 
             match batch_result {
                 BatchResult::Found {
@@ -792,60 +892,37 @@ enum BatchResult {
     DeviceLost,
 }
 
-/// Run a single batch of GPU computation
+/// Run a single batch of GPU computation.
+///
+/// When `inputs_prequeued` is true, midstate/nonce/dispatch for this batch were
+/// already submitted during the previous batch's staging `map_async` poll.
+/// `next_batch`, if present, has its inputs queued during this batch's poll.
 fn run_single_batch(
     gpu_ctx: &GpuContext,
     resources: &GpuResources,
     ctx: &JobContext,
     batch_start: U512,
     batch_size: u32,
+    staging_index: usize,
+    inputs_prequeued: bool,
+    next_batch: Option<(U512, u32)>,
 ) -> BatchResult {
-    // Calculate dispatch configuration for this batch
-    let threads_per_workgroup = 256u32;
-    let limits = gpu_ctx.device.limits();
-    let max_workgroups = limits.max_compute_workgroups_per_dimension;
+    debug_assert!(staging_index < 2);
+    let frame_start = std::time::Instant::now();
+    let params = compute_batch_dispatch(gpu_ctx, batch_size);
 
-    let hinted_workgroups = gpu_ctx.optimal_workgroups.max(1).min(max_workgroups);
-    let hinted_threads = hinted_workgroups as u64 * threads_per_workgroup as u64;
+    if !inputs_prequeued {
+        write_batch_inputs(gpu_ctx, resources, ctx, batch_start, &params);
+    }
+    let after_inputs = std::time::Instant::now();
 
-    let logical_threads = (batch_size as u64).min(hinted_threads).max(1);
-    let num_workgroups = ((logical_threads as u32).div_ceil(threads_per_workgroup)).max(1);
-    let total_threads = (num_workgroups * threads_per_workgroup) as u64;
-    let nonces_per_thread = ((batch_size as u64).div_ceil(total_threads)).max(1) as u32;
-
-    // Dispatch config: [total_threads, nonces_per_thread, total_nonces]
-    let dispatch_config = [total_threads as u32, nonces_per_thread, batch_size, 0];
-
-    // Write dispatch config
-    gpu_ctx.queue.write_buffer(
-        &resources.dispatch_config_buffer,
-        0,
-        bytemuck::cast_slice(&dispatch_config),
-    );
-
-    // Write start nonce for this batch
-    let start_nonce_bytes = batch_start.to_little_endian();
-    gpu_ctx
-        .queue
-        .write_buffer(&resources.start_nonce_buffer, 0, &start_nonce_bytes);
-
-    let nonce_be = batch_start.to_big_endian();
-    let midstate_u32s =
-        pow_core::mining_midstate_u32s(ctx.header, nonce_be[..32].try_into().unwrap());
-    gpu_ctx.queue.write_buffer(
-        &resources.midstate_buffer,
-        0,
-        bytemuck::cast_slice(&midstate_u32s),
-    );
-
-    // Reset results buffer
-    const RESULTS_SIZE: usize = (1 + 16 + 16) * 4;
     const ZEROS: [u8; RESULTS_SIZE] = [0; RESULTS_SIZE];
     gpu_ctx
         .queue
         .write_buffer(&resources.results_buffer, 0, &ZEROS);
 
-    // Create and submit command buffer
+    let staging_buffer = &resources.staging_buffers[staging_index];
+
     let mut encoder = gpu_ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -856,40 +933,52 @@ fn run_single_batch(
         });
         cpass.set_pipeline(&gpu_ctx.pipeline);
         cpass.set_bind_group(0, &resources.bind_group, &[]);
-        cpass.dispatch_workgroups(num_workgroups, 1, 1);
+        cpass.dispatch_workgroups(params.num_workgroups, 1, 1);
     }
     encoder.copy_buffer_to_buffer(
         &resources.results_buffer,
         0,
-        &resources.staging_buffer,
+        staging_buffer,
         0,
         RESULTS_SIZE as u64,
     );
 
     gpu_ctx.queue.submit(Some(encoder.finish()));
+    let after_submit = std::time::Instant::now();
 
-    // Wait for GPU to complete (blocking)
-    let buffer_slice = resources.staging_buffer.slice(..);
-    // Use atomic to track completion: 0 = pending, 1 = success, 2 = error
+    let buffer_slice = staging_buffer.slice(..);
     let map_status = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
     let map_status_clone = map_status.clone();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
         map_status_clone.store(if result.is_ok() { 1 } else { 2 }, Ordering::Release);
     });
 
-    // Poll until complete, error, or timeout (30 seconds max to prevent infinite hang)
     let poll_start = std::time::Instant::now();
     let max_poll_duration = std::time::Duration::from_secs(30);
+    let mut next_inputs_queued = false;
+    let next_params = next_batch.map(|(start, size)| {
+        (
+            start,
+            compute_batch_dispatch(gpu_ctx, size),
+        )
+    });
+
     let final_status = loop {
+        if !next_inputs_queued {
+            if let Some((next_start, ref next_dispatch)) = next_params {
+                write_batch_inputs(gpu_ctx, resources, ctx, next_start, next_dispatch);
+                next_inputs_queued = true;
+            }
+        }
+
         let _ = gpu_ctx.device.poll(wgpu::PollType::Wait {
             submission_index: None,
-            timeout: Some(std::time::Duration::from_millis(10)),
+            timeout: Some(std::time::Duration::from_millis(1)),
         });
 
         match map_status.load(Ordering::Acquire) {
-            1 => break 1, // Success - buffer is mapped
+            1 => break 1,
             2 => {
-                // Mapping failed - buffer was never successfully mapped, don't unmap
                 log::error!(
                     target: "gpu_engine",
                     "GPU buffer mapping failed - possible device lost or resource error"
@@ -897,39 +986,35 @@ fn run_single_batch(
                 return BatchResult::DeviceLost;
             }
             _ => {
-                // Still pending - check timeout
                 if poll_start.elapsed() > max_poll_duration {
                     log::error!(
                         target: "gpu_engine",
                         "GPU buffer mapping timed out after {}s - GPU may be unresponsive",
                         max_poll_duration.as_secs()
                     );
-                    // Timeout: map_async callback never fired, buffer not mapped, don't unmap
                     return BatchResult::DeviceLost;
                 }
             }
         }
     };
 
-    // Only reach here if final_status == 1 (success), buffer is mapped
     debug_assert_eq!(final_status, 1);
+    let after_poll = std::time::Instant::now();
 
-    // Read results
     let data = buffer_slice.get_mapped_range();
     let result_u32s: &[u32] = bytemuck::cast_slice(&data);
 
-    // Calculate the actual number of nonces dispatched
+    let total_threads = params.total_threads;
+    let nonces_per_thread = params.nonces_per_thread;
     let dispatched_nonces = (total_threads * nonces_per_thread as u64).min(batch_size as u64);
 
     if result_u32s[0] != 0 {
-        // Solution found!
         let nonce_u32s = &result_u32s[1..17];
         let hash_u32s = &result_u32s[17..33];
         let nonce = U512::from_little_endian(bytemuck::cast_slice(nonce_u32s));
         let hash = U512::from_little_endian(bytemuck::cast_slice(hash_u32s));
         let work = nonce.to_big_endian();
 
-        // Calculate hashes computed based on GPU parallel execution model
         let hashes_computed = if nonce >= batch_start {
             let logical_index = (nonce - batch_start).as_u64();
             let winning_iteration = logical_index % (nonces_per_thread as u64);
@@ -939,7 +1024,19 @@ fn run_single_batch(
         };
 
         drop(data);
-        resources.staging_buffer.unmap();
+        staging_buffer.unmap();
+        let after_readback = std::time::Instant::now();
+        log::debug!(
+            target: "gpu_engine",
+            "batch host timing staging={} nonces={} inputs_us={} submit_us={} poll_us={} readback_us={} total_us={}",
+            staging_index,
+            batch_size,
+            after_inputs.duration_since(frame_start).as_micros(),
+            after_submit.duration_since(after_inputs).as_micros(),
+            after_poll.duration_since(after_submit).as_micros(),
+            after_readback.duration_since(after_poll).as_micros(),
+            after_readback.duration_since(frame_start).as_micros(),
+        );
 
         return BatchResult::Found {
             candidate: Candidate { nonce, work, hash },
@@ -948,7 +1045,20 @@ fn run_single_batch(
     }
 
     drop(data);
-    resources.staging_buffer.unmap();
+    staging_buffer.unmap();
+    let after_readback = std::time::Instant::now();
+
+    log::debug!(
+        target: "gpu_engine",
+        "batch host timing staging={} nonces={} inputs_us={} submit_us={} poll_us={} readback_us={} total_us={}",
+        staging_index,
+        batch_size,
+        after_inputs.duration_since(frame_start).as_micros(),
+        after_submit.duration_since(after_inputs).as_micros(),
+        after_poll.duration_since(after_submit).as_micros(),
+        after_readback.duration_since(after_poll).as_micros(),
+        after_readback.duration_since(frame_start).as_micros(),
+    );
 
     BatchResult::NotFound {
         hash_count: dispatched_nonces,
@@ -963,7 +1073,26 @@ fn get_vendor_specific_dispatch(adapter_info: &wgpu::AdapterInfo, device: &wgpu:
     let is_metal = adapter_info.backend == wgpu::Backend::Metal;
     let tier = gpu_tiers::detect_gpu_tier(&adapter_info.name, adapter_info.vendor, is_metal);
 
-    let optimal_workgroups = (max_workgroups / tier.workgroup_divisor).max(tier.min_workgroups);
+    let mut optimal_workgroups =
+        (max_workgroups / tier.workgroup_divisor).max(tier.min_workgroups);
+
+    if is_metal {
+        if let Ok(v) = std::env::var("MAC_WORKGROUP_OVERRIDE") {
+            if let Ok(n) = v.parse::<u32>() {
+                if n >= 1 {
+                    optimal_workgroups = n.min(max_workgroups);
+                }
+            }
+        } else {
+            // Apple GPU saturation guideline (~16k workgroups × 256 threads).
+            const APPLE_SATURATION_WORKGROUPS: u32 = 16_384;
+            if max_workgroups >= APPLE_SATURATION_WORKGROUPS {
+                optimal_workgroups = optimal_workgroups
+                    .max(APPLE_SATURATION_WORKGROUPS.min(max_workgroups))
+                    .min(max_workgroups);
+            }
+        }
+    }
 
     // Log GPU detection result
     log::info!(

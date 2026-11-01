@@ -8,6 +8,20 @@
 //! - other GPUs + `SHADER_INT64` → native u64 (`mining_u64.wgsl`)
 //! - no `SHADER_INT64` → 32-bit fallback (`mining.wgsl`)
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use pow_core::JobContext;
+use primitive_types::U512;
+
+static APPLE_SHADER_WITH_HARNESS: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}\n{}",
+        include_str!("mining_u64_apple.wgsl"),
+        include_str!("mining_u64_apple_test_harness.wgsl")
+    )
+});
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kernel {
     U32,
@@ -18,6 +32,11 @@ pub enum Kernel {
 impl Kernel {
     pub const fn needs_int64(self) -> bool {
         !matches!(self, Self::U32)
+    }
+
+    /// True when the host must byte-swap each target u32 before GPU upload (Apple compare path).
+    pub const fn pre_bswap_target_upload(self) -> bool {
+        matches!(self, Self::Apple)
     }
 
     pub const fn id(self) -> &'static str {
@@ -36,12 +55,42 @@ impl Kernel {
         }
     }
 
-    pub const fn source(self) -> &'static str {
+    /// WGSL compiled into the mining pipeline (production; Apple excludes test harness).
+    pub const fn mining_source(self) -> &'static str {
         match self {
             Self::U32 => include_str!("mining.wgsl"),
             Self::Default => include_str!("mining_u64.wgsl"),
             Self::Apple => include_str!("mining_u64_apple.wgsl"),
         }
+    }
+
+    /// WGSL for component tests (Apple includes u32 compat harness).
+    pub fn test_source(self) -> Cow<'static, str> {
+        match self {
+            Self::Apple => Cow::Owned(APPLE_SHADER_WITH_HARNESS.clone()),
+            other => Cow::Borrowed(other.mining_source()),
+        }
+    }
+
+    /// Target buffer words for this kernel (16 u32s, little-endian U512 limbs).
+    pub fn target_u32s_upload(self, target: U512) -> [u32; 16] {
+        let bytes = target.to_little_endian();
+        let mut words = [0u32; 16];
+        for i in 0..16 {
+            let chunk = &bytes[i * 4..(i + 1) * 4];
+            words[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        if self.pre_bswap_target_upload() {
+            for w in &mut words {
+                *w = w.swap_bytes();
+            }
+        }
+        words
+    }
+
+    /// Convenience wrapper around [`JobContext::target`].
+    pub fn job_target_u32s(self, ctx: &JobContext) -> [u32; 16] {
+        self.target_u32s_upload(ctx.target)
     }
 
     pub fn for_adapter(adapter: &wgpu::Adapter) -> Self {
@@ -61,6 +110,11 @@ impl Kernel {
 
     pub const fn all() -> &'static [Self] {
         &[Self::U32, Self::Default, Self::Apple]
+    }
+
+    /// Backward-compatible alias for [`Self::test_source`].
+    pub fn source(self) -> Cow<'static, str> {
+        self.test_source()
     }
 }
 
@@ -114,5 +168,12 @@ mod tests {
             Kernel::for_adapter_info(&info(wgpu::Backend::Vulkan), wgpu::Features::empty()),
             Kernel::U32
         );
+    }
+
+    #[test]
+    fn apple_test_source_includes_harness() {
+        let src = Kernel::Apple.test_source();
+        assert!(src.contains("fn hash_squeeze_twice"));
+        assert!(!Kernel::Apple.mining_source().contains("fn hash_squeeze_twice"));
     }
 }

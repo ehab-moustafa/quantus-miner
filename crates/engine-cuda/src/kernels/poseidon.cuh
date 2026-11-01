@@ -1,0 +1,309 @@
+#include "field.cuh"
+
+// Round-constant tables carry one extra zero row (RC_INITIAL's last row holds
+// the first internal constant in slot 0) so the round loops index them
+// without per-round selects.
+__constant__ u64 RC_INTERNAL[23] = {
+    0x97f7798a784ad863ULL, 0xd1d2bf082f60d4f0ULL, 0x69a377a79f9ad206ULL,
+    0xa9d06906a3858e24ULL, 0x295275001eede5b5ULL, 0x5874e441117bd746ULL,
+    0x8a084bbba8ed86ccULL, 0x3defd7645cde6425ULL, 0x3998cfe6871cc137ULL,
+    0x3e52ef8bca48314aULL, 0x964a209f85dc9eccULL, 0x3fcc9ee82cc4577eULL,
+    0x8e79b4a5d0096d6dULL, 0x8492362ad2392556ULL, 0xee72f470262574d6ULL,
+    0x1e0e18496da2444aULL, 0x0f3a74bf215eaac6ULL, 0x1b061b76a1c0ded3ULL,
+    0x192c42d86803d7a6ULL, 0xf6d49ff997ae0260ULL, 0x3ec372e7a0fa3786ULL,
+    0x5538cdf4f23445d3ULL, 0ULL};
+
+__constant__ u64 RC_INITIAL[5][12] = {
+    {0xc002e770975b1607ULL, 0xbca51a8dfe14593aULL, 0x72938dfbe774f7f9ULL,
+     0xe4f2fe29e03234acULL, 0xd5e0ba2f541b6449ULL, 0xec33b868f3cc46c1ULL,
+     0x486dcb55419d475aULL, 0x6c1cb2a358cc24f1ULL, 0xe3f30d509a1436bbULL,
+     0xd9a64f068dca7c29ULL, 0xe59b3f57aabba1aeULL, 0x2a3dd4505b478fdcULL},
+    {0xada1f8dc7676ed25ULL, 0x2711aa8b5509d516ULL, 0x4ae6acd0c9c92897ULL,
+     0x56eb3d6b5256d67aULL, 0x1f7a9d55923bf51eULL, 0x3600427d397a7f68ULL,
+     0xe5076df75b72c3d0ULL, 0xfcd59aa12c6090adULL, 0xcd895e8c68b57a9eULL,
+     0x41df7ef9d730ae3eULL, 0xee3e2b889abe977dULL, 0xd29bb7edbeb9c405ULL},
+    {0x7d5c08eef608e382ULL, 0x89ae889caaf0802cULL, 0xb35a8e976d2af617ULL,
+     0xdb14234eafaf5173ULL, 0x78f04462d48b1c98ULL, 0x265293b0e47ce88aULL,
+     0x999a649b69b9d32fULL, 0x64b0a186698e01d3ULL, 0xee0b22d0dfae8bb8ULL,
+     0x4fd53e50ca04a7eeULL, 0x5762bfe181f25047ULL, 0xf51593e2beb5e3bdULL},
+    {0x1e5e2b5760e32477ULL, 0x622462a1f9aaaeedULL, 0xaa284b3ecdb222aeULL,
+     0x63c8e72f542bf3fcULL, 0x3ba588cacb43b5e0ULL, 0x23eda6f3c99150ddULL,
+     0xaad3bea4baac9a5aULL, 0xe9da8d699b94184aULL, 0xcdb13f4cd93e024cULL,
+     0x902cbd0956f655e3ULL, 0x5b4e40ffc759532fULL, 0xde795c20a2357af7ULL},
+    {0x97f7798a784ad863ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL,
+     0ULL, 0ULL}};
+
+__constant__ u64 RC_TERMINAL[5][12] = {
+    {0x7b72c539e0ea4c6eULL, 0x144573dae2ce9976ULL, 0x802028b68f35fc88ULL,
+     0x6d36c5022c4fe7c2ULL, 0xa205d0ffa9b9def3ULL, 0xf6e7e38b1ea6ba2fULL,
+     0x34f7909ae5258d64ULL, 0xb0464d9d77b97fcaULL, 0x64ddb9d5de7e00a6ULL,
+     0x0ed0d75c27975d97ULL, 0x1cbb36f11127338bULL, 0x6673e505cfd0b6baULL},
+    {0x605f902830872e01ULL, 0x3fd5eb927e95fe4fULL, 0xe81025b5a24c69cdULL,
+     0xf7d0ce75de23f74eULL, 0xf39942b6a8585089ULL, 0x6d808a08f7b71df6ULL,
+     0xf8806b6588f49a8bULL, 0x57df2d8c2a32107aULL, 0x16e7c2074d654a2dULL,
+     0x213de241fcf33835ULL, 0xb0f2b8905a0976f6ULL, 0xd8e3cf2bbd355417ULL},
+    {0xe498691679d9330fULL, 0x763b45d2a3821b28ULL, 0x0908bf65eb0a1f0dULL,
+     0x7691eb2d194b24f4ULL, 0x0e43551233ae13b2ULL, 0x93c393dbfc2fe76fULL,
+     0x98f607485d48cdeaULL, 0xe3d95f30309819c0ULL, 0x1ef581a93eaf6acfULL,
+     0x0b24c1b7a030fca4ULL, 0x624370be5670b327ULL, 0x5f1e28615a11e486ULL},
+    {0xfe04051f909e042bULL, 0x7257e5b147fd3803ULL, 0xe6ae134bb82f2e78ULL,
+     0x5711fd5cf4784511ULL, 0xf83a42660c08c0bcULL, 0x2cd8c96d9a3ce855ULL,
+     0x7d2ffb1bb0e17271ULL, 0x85ae1528caea3811ULL, 0x52a345d5c7adb0b8ULL,
+     0x504c4c51f3faee94ULL, 0xbce34a649cfccaf9ULL, 0xe0a3389266fb6dc9ULL},
+    {0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL, 0ULL}};
+
+__constant__ u64 MDS_DIAG[12] = {
+    0xc3b6c08e23ba9300ULL, 0xd84b5de94a324fb6ULL, 0x0d0c371c5b35b84fULL,
+    0x7964f570e7188037ULL, 0x5daf18bbd996604bULL, 0x6743bc47b9595257ULL,
+    0x5528b9362c59bb70ULL, 0xac45e25b7127b68bULL, 0xa2077d7dfbb606b5ULL,
+    0xf3faac6faee378aeULL, 0x0c6388b51545e883ULL, 0xd27dbb6944917b60ULL};
+
+__device__ __forceinline__ void ext_layer64_chunk4(u64 x0, u64 x1, u64 x2, u64 x3,
+                                                   Wide &y0, Wide &y1, Wide &y2,
+                                                   Wide &y3) {
+    Wide t01 = wide_from(x0);
+    wide_add(t01, x1);
+    Wide t23 = wide_from(x2);
+    wide_add(t23, x3);
+    Wide t0123 = t01;
+    wide_add_wide(t0123, t23);
+    Wide t01123 = t0123;
+    wide_add(t01123, x1);
+    Wide t01233 = t0123;
+    wide_add(t01233, x3);
+    y3 = t01233;
+    wide_add(y3, x0);
+    wide_add(y3, x0);
+    y1 = t01123;
+    wide_add(y1, x2);
+    wide_add(y1, x2);
+    y0 = t01123;
+    wide_add_wide(y0, t01);
+    y2 = t01233;
+    wide_add_wide(y2, t23);
+}
+
+__device__ __forceinline__ void ext_layer64_lane_reduce(Wide w, const Wide &col_sum,
+                                                        u64 rc, u64 *out) {
+    wide_add_wide(w, col_sum);
+    wide_add(w, rc);
+    *out = wide_reduce(w);
+}
+
+// Column sums are one wide M4 on the three lanes of each residue class.
+// Each output lane still runs M4, then adds that column sum and the round constant.
+__device__ __forceinline__ void ext_layer64_reduce_chunk4(
+    u64 x0, u64 x1, u64 x2, u64 x3, const Wide col_sum[4], u64 rc0, u64 rc1,
+    u64 rc2, u64 rc3, u64 *o0, u64 *o1, u64 *o2, u64 *o3) {
+    Wide y0, y1, y2, y3;
+    ext_layer64_chunk4(x0, x1, x2, x3, y0, y1, y2, y3);
+    ext_layer64_lane_reduce(y0, col_sum[0], rc0, o0);
+    ext_layer64_lane_reduce(y1, col_sum[1], rc1, o1);
+    ext_layer64_lane_reduce(y2, col_sum[2], rc2, o2);
+    ext_layer64_lane_reduce(y3, col_sum[3], rc3, o3);
+}
+
+// M4 is integer-linear and each column sum of three chunks fits in 96 bits,
+// so one wide M4 on the summed lanes equals the old two-pass accumulation.
+__device__ __forceinline__ void ext_layer64_chunk4_wide(Wide x0, Wide x1, Wide x2, Wide x3,
+                                                        Wide &y0, Wide &y1, Wide &y2, Wide &y3) {
+    Wide t01 = x0;
+    wide_add_wide(t01, x1);
+    Wide t23 = x2;
+    wide_add_wide(t23, x3);
+    Wide t0123 = t01;
+    wide_add_wide(t0123, t23);
+    Wide t01123 = t0123;
+    wide_add_wide(t01123, x1);
+    Wide t01233 = t0123;
+    wide_add_wide(t01233, x3);
+    y3 = t01233;
+    wide_add_wide(y3, x0);
+    wide_add_wide(y3, x0);
+    y1 = t01123;
+    wide_add_wide(y1, x2);
+    wide_add_wide(y1, x2);
+    y0 = t01123;
+    wide_add_wide(y0, t01);
+    y2 = t01233;
+    wide_add_wide(y2, t23);
+}
+
+__device__ __forceinline__ void ext_layer64_col_sum(const u64 *state, Wide col_sum[4]) {
+    Wide s0 = wide_from(state[0]);
+    wide_add(s0, state[4]);
+    wide_add(s0, state[8]);
+    Wide s1 = wide_from(state[1]);
+    wide_add(s1, state[5]);
+    wide_add(s1, state[9]);
+    Wide s2 = wide_from(state[2]);
+    wide_add(s2, state[6]);
+    wide_add(s2, state[10]);
+    Wide s3 = wide_from(state[3]);
+    wide_add(s3, state[7]);
+    wide_add(s3, state[11]);
+    ext_layer64_chunk4_wide(s0, s1, s2, s3, col_sum[0], col_sum[1], col_sum[2], col_sum[3]);
+}
+
+#ifdef MINER_CUDA_EXT_V2
+// Experimental: pass-2 fully unrolled (no chunk loop) so ptxas can overlap
+// reduce128 chains across the twelve lanes; enable with MINER_CUDA_EXT_V2=1.
+__device__ __forceinline__ void ext_layer64(u64 *state, const u64 *rc12) {
+    Wide col_sum[4];
+    ext_layer64_col_sum(state, col_sum);
+    ext_layer64_reduce_chunk4(state[0], state[1], state[2], state[3], col_sum,
+                              rc12[0], rc12[1], rc12[2], rc12[3], &state[0],
+                              &state[1], &state[2], &state[3]);
+    ext_layer64_reduce_chunk4(state[4], state[5], state[6], state[7], col_sum,
+                              rc12[4], rc12[5], rc12[6], rc12[7], &state[4],
+                              &state[5], &state[6], &state[7]);
+    ext_layer64_reduce_chunk4(state[8], state[9], state[10], state[11], col_sum,
+                              rc12[8], rc12[9], rc12[10], rc12[11], &state[8],
+                              &state[9], &state[10], &state[11]);
+}
+#else
+__device__ __forceinline__ void ext_layer64(u64 *state, const u64 *rc12) {
+    Wide col_sum[4];
+    ext_layer64_col_sum(state, col_sum);
+    #pragma unroll
+    for (int chunk = 0; chunk < 3; chunk++) {
+        int o = chunk * 4;
+        u64 rc0 = rc12[o], rc1 = rc12[o + 1], rc2 = rc12[o + 2],
+            rc3 = rc12[o + 3];
+        ext_layer64_reduce_chunk4(state[o], state[o + 1], state[o + 2],
+                                  state[o + 3], col_sum, rc0, rc1, rc2, rc3,
+                                  &state[o], &state[o + 1], &state[o + 2],
+                                  &state[o + 3]);
+    }
+}
+#endif
+
+// Software-pipelined internal round. `x` is this round's S-boxed element 0.
+// Elements 1..11 are summed before x is needed, element 0's output comes out
+// first so the caller can start the next S-box while the other 11 products
+// retire, and the unreduced 96-bit row sum (plus rc0 for element 0) rides in
+// the multiply accumulators. Returns the new element 0; updates state[1..11].
+__device__ __forceinline__ u64 int_round_p(u64 *state, u64 x, u64 rc0) {
+    Wide s = wide_from(state[1]);
+    #pragma unroll
+    for (int i = 2; i < 12; i++) {
+        wide_add(s, state[i]);
+    }
+    wide_add(s, x);
+    Wide s0 = s;
+    wide_add(s0, rc0);
+    u32 r0, r1, r2, r3;
+    mul64wide(x, MDS_DIAG[0], r0, r1, r2, r3);
+    add128_wide(r0, r1, r2, r3, s0);
+    u64 out0 = reduce128(r0, r1, r2, r3);
+    #pragma unroll
+    for (int i = 1; i < 12; i++) {
+        mul64wide(state[i], MDS_DIAG[i], r0, r1, r2, r3);
+        add128_wide(r0, r1, r2, r3, s);
+        state[i] = reduce128(r0, r1, r2, r3);
+    }
+    return out0;
+}
+
+__device__ __forceinline__ void permute64_after_initial(u64 *state) {
+    #pragma unroll 1
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int i = 0; i < 12; i++) {
+            state[i] = gf64_sbox(state[i]);
+        }
+        ext_layer64(state, RC_INITIAL[r + 1]);
+    }
+    u64 x = gf64_sbox(state[0]);
+    #pragma unroll 1
+    for (int r = 0; r < 21; r++) {
+        x = gf64_sbox(int_round_p(state, x, RC_INTERNAL[r + 1]));
+    }
+    state[0] = int_round_p(state, x, 0ULL);
+    #pragma unroll
+    for (int i = 0; i < 12; i++) {
+        state[i] = gf64_add(state[i], RC_TERMINAL[0][i]);
+    }
+    #pragma unroll 1
+    for (int r = 0; r < 4; r++) {
+        #pragma unroll
+        for (int i = 0; i < 12; i++) {
+            state[i] = gf64_sbox(state[i]);
+        }
+        ext_layer64(state, RC_TERMINAL[r + 1]);
+    }
+}
+
+__device__ __forceinline__ void permute64(u64 *state) {
+    ext_layer64(state, RC_INITIAL[0]);
+    permute64_after_initial(state);
+}
+
+__device__ __forceinline__ void permute64_twice_after_initial(u64 *state) {
+    permute64_after_initial(state);
+    state[0] = gf64_add(state[0], 1ULL);
+    state[1] = gf64_add(state[1], 1ULL);
+    ext_layer64(state, RC_INITIAL[0]);
+    permute64_after_initial(state);
+}
+
+__device__ __forceinline__ u32 bswap32(u32 v) {
+    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) | ((v >> 8) & 0xFF00u) |
+           (v >> 24);
+}
+
+__device__ __forceinline__ void nonce_from_index(const u32 *nonce_base,
+                                                 u32 logical_index,
+                                                 u32 *current_nonce) {
+    u32 val0 = nonce_base[0];
+    u32 sum0 = val0 + logical_index;
+    current_nonce[0] = sum0;
+    u32 carry = (sum0 < val0) ? 1u : 0u;
+    #pragma unroll
+    for (int i = 1; i < 8; i++) {
+        u32 val = nonce_base[i];
+        u32 sum = val + carry;
+        current_nonce[i] = sum;
+        carry = (sum < val) ? 1u : 0u;
+    }
+    #pragma unroll
+    for (int i = 8; i < 16; i++) {
+        current_nonce[i] = nonce_base[i];
+    }
+}
+
+__device__ __forceinline__ void hash_from_midstate(const u64 *mid,
+                                                   const u32 *current_nonce,
+                                                   u32 *hash_le) {
+    u64 st[12];
+    #pragma unroll
+    for (int i = 0; i < 12; i++) {
+        st[i] = mid[i];
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        st[i] = GF64_ADD_NONCE_STEP(st[i], (u64)bswap32(current_nonce[7 - i]));
+    }
+    permute64(st);
+    st[0] = gf64_add(st[0], 1ULL);
+    st[1] = gf64_add(st[1], 1ULL);
+    permute64(st);
+    u32 first[8];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 c = gf64_canon(st[i]);
+        first[2 * i] = (u32)(c & EPS64);
+        first[2 * i + 1] = (u32)(c >> 32);
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        hash_le[15 - i] = bswap32(first[i]);
+    }
+    permute64(st);
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 c = gf64_canon(st[i]);
+        hash_le[7 - 2 * i] = bswap32((u32)(c & EPS64));
+        hash_le[6 - 2 * i] = bswap32((u32)(c >> 32));
+    }
+}

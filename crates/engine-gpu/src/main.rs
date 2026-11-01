@@ -1,5 +1,4 @@
-mod end_to_end_tests;
-mod tests;
+use engine_gpu::{end_to_end_tests, tests, Kernel};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -15,7 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut failures = 0usize;
     let has_int64 = adapter.features().contains(wgpu::Features::SHADER_INT64);
 
-    for kernel in engine_gpu::Kernel::all() {
+    for kernel in Kernel::all() {
         if kernel.needs_int64() && !has_int64 {
             println!(
                 "\nSHADER_INT64 not supported on this adapter; skipping {}",
@@ -34,7 +33,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..Default::default()
             })
             .await?;
-        failures += run_suite(&device, &queue, kernel.source(), kernel.label()).await;
+        let shader_src = kernel.test_source();
+        failures += run_suite(
+            &device,
+            &queue,
+            *kernel,
+            shader_src.as_ref(),
+            kernel.label(),
+        )
+        .await;
     }
 
     if failures > 0 {
@@ -47,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_suite(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    kernel: Kernel,
     shader_src: &str,
     label: &str,
 ) -> usize {
@@ -125,7 +133,7 @@ async fn run_suite(
     );
     run!(
         "end-to-end mining",
-        end_to_end_tests::test_end_to_end_mining(device, queue, shader_src)
+        end_to_end_tests::test_end_to_end_mining(device, queue, kernel, shader_src)
     );
 
     failures

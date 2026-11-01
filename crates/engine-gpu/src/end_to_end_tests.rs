@@ -1,3 +1,4 @@
+use crate::Kernel;
 use pow_core::{hash_from_nonce, JobContext};
 use primitive_types::U512;
 use rand::Rng;
@@ -7,6 +8,7 @@ use wgpu::util::DeviceExt;
 pub async fn test_end_to_end_mining(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    kernel: Kernel,
     shader_src: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Running End-to-End Mining Test...");
@@ -44,12 +46,7 @@ pub async fn test_end_to_end_mining(
     });
 
     // Target Buffer
-    let target_bytes = ctx.target.to_little_endian();
-    let mut target_u32s = [0u32; 16];
-    for i in 0..16 {
-        let chunk = &target_bytes[i * 4..(i + 1) * 4];
-        target_u32s[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-    }
+    let target_u32s = kernel.job_target_u32s(&ctx);
     let target_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Target Buffer"),
         contents: bytemuck::cast_slice(&target_u32s),

@@ -1,7 +1,8 @@
 #![deny(rust_2018_idioms)]
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::{compile_ptx_with_opts, sys as nvrtc_sys, CompileOptions, Ptx};
 use engine_cpu::{CancelCheck, Candidate, EngineStatus, FoundOrigin, MinerEngine, Range};
@@ -14,13 +15,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const KERNEL_SRC: &str = include_str!("kernels/mining.cu");
-const THREADS_PER_BLOCK: u32 = 256;
-const MAX_BLOCKS: u32 = 4096;
+const DEFAULT_THREADS_PER_BLOCK: u32 = 256;
+const DEFAULT_MAX_BLOCKS: u32 = 4096;
+/// Inner-loop span where nonce-line `pk[14]` is constant (Idea B / #110).
+const DEFAULT_K_SEGMENT: u32 = 1 << 26;
 /// Lowest candidate index (`u32::MAX` = none), then the count of nonces that
 /// candidate threads left unevaluated. Both are only ever updated atomically.
 /// Candidate count, then up to `MAX_HITS` candidate indices in claim order.
 const MAX_HITS: usize = 8;
 const RESULTS_U32S: usize = 1 + MAX_HITS;
+
+const NONCE_LINE_K_V: [i32; 8] = [4, -17, 11, -3, -4, 17, -11, 3];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -29,14 +34,38 @@ struct MiningParams {
     start_nonce: [u32; 16],
     difficulty_target: [u32; 16],
     dispatch_config: [u32; 3],
+    nonce_line_k_base: [u32; 8],
+    nonce_line_v: [i32; 8],
+    nonce_line_pk: [u64; 14],
+    nonce_line_t_base: u32,
+    nonce_line_pad: u32,
 }
 
 unsafe impl cudarc::driver::DeviceRepr for MiningParams {}
+unsafe impl cudarc::driver::ValidAsZeroBits for MiningParams {}
+
+fn cuda_use_nonce_line() -> bool {
+    miner_cuda_nonce_line_env_enabled()
+}
+
+fn mining_kernel_name() -> &'static str {
+    if cuda_use_nonce_line() {
+        "mining_main_nonce_line"
+    } else {
+        "mining_main"
+    }
+}
 
 struct CudaDevice {
     ctx: Arc<CudaContext>,
     module: Arc<CudaModule>,
     name: String,
+}
+
+/// Params H2D finished on the copy stream; compute waits before launch.
+struct StagedSegmentParams {
+    batch_start: U512,
+    slot: u8,
 }
 
 struct WorkerBuffers {
@@ -51,6 +80,11 @@ struct WorkerBuffers {
     hash: CudaFunction,
     busy: Duration,
     busy_since: Instant,
+    params_dev: [CudaSlice<MiningParams>; 2],
+    params_h2d_ready: [Option<CudaEvent>; 2],
+    copy_stream: Option<Arc<CudaStream>>,
+    param_slot: u8,
+    staged_first_segment: Option<StagedSegmentParams>,
 }
 
 /// Native CUDA mining engine.
@@ -61,7 +95,7 @@ struct WorkerBuffers {
 /// difficulties far below real mining), and the host recomputes each one with
 /// the exact CPU hash, returning the lowest that is really below the target.
 /// The kernel's Goldilocks reduction skips two carry corrections (`reduce128`
-/// in `kernels/mining.cu`): each of the roughly 1,470 field multiplies per
+/// in `kernels/field.cuh`): each of the roughly 1,470 field multiplies per
 /// hash can be off by EPS mod p with probability about 2^-33, so about one
 /// nonce in three million is hashed wrong on the GPU. A wrong hash that lands
 /// below the target is rejected by the CPU check; a wrong hash for a nonce that
@@ -84,6 +118,238 @@ thread_local! {
     static ASSIGNED_DEVICE: RefCell<Option<(usize, usize)>> = const { RefCell::new(None) };
     static WORKER_BUFFERS: RefCell<Option<WorkerBuffers>> = const { RefCell::new(None) };
     static DEVICE_LOST: RefCell<Option<usize>> = const { RefCell::new(None) };
+}
+
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(default)
+}
+
+fn cuda_launch_config() -> (u32, u32) {
+    (
+        env_u32("MINER_CUDA_BLOCK_DIM", DEFAULT_THREADS_PER_BLOCK),
+        env_u32("MINER_CUDA_MAX_BLOCKS", DEFAULT_MAX_BLOCKS),
+    )
+}
+
+fn cuda_k_segment_size() -> u32 {
+    env_u32("MINER_CUDA_K_SEGMENT", DEFAULT_K_SEGMENT)
+}
+
+/// Experimental host/GPU overlap: double-buffered [`MiningParams`] H2D on a
+/// copy stream while the previous segment kernel runs (`MINER_CUDA_PIPELINE=1`).
+fn cuda_pipeline_enabled() -> bool {
+    std::env::var("MINER_CUDA_PIPELINE")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// When true, host batching aligns k-segments for nonce-line `pk[14]` (A2).
+/// Set via `MINER_CUDA_NONCE_LINE=1` or `true`.
+pub fn miner_cuda_nonce_line_env_enabled() -> bool {
+    std::env::var("MINER_CUDA_NONCE_LINE")
+        .ok()
+        .is_some_and(|v| {
+            matches!(
+                v.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+}
+
+/// True once A1 links a nonce-line mining entry (separate from flat `mining_main`).
+pub fn miner_cuda_nonce_line_kernel_ready() -> bool {
+    true
+}
+
+/// Experimental `ext_layer64` pass-2 scheduling (`-DMINER_CUDA_EXT_V2` at NVRTC).
+fn cuda_ext_v2_enabled() -> bool {
+    std::env::var("MINER_CUDA_EXT_V2")
+        .ok()
+        .is_some_and(|v| {
+            matches!(
+                v.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
+}
+
+/// Skip rare second Goldilocks carry fold on nonce / `t` steps (#110 item 3).
+fn cuda_lazy_carry_enabled() -> bool {
+    std::env::var("MINER_CUDA_LAZY_CARRY")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// NVRTC `-D` flags that must bust the per-arch PTX cache when toggled.
+fn nvrtc_compile_tag() -> u32 {
+    let mut tag = cuda_gf64_32bit_flag() as u32;
+    if cuda_lazy_carry_enabled() {
+        tag |= 2;
+    }
+    if cuda_ext_v2_enabled() {
+        tag |= 4;
+    }
+    tag
+}
+
+/// Metadata passed when building per-segment [`MiningParams`].
+#[derive(Clone, Copy, Debug)]
+struct KSegmentContext {
+    #[allow(dead_code)]
+    segment_index: usize,
+    #[allow(dead_code)]
+    segment_count: usize,
+    k_segment_nonces: u32,
+    /// Nonce-line `k` for this segment; `None` in flat `mining_main` mode.
+    #[allow(dead_code)]
+    k_index: Option<u64>,
+    /// Absolute `t` at `segment_start` when nonce-line mode is active.
+    t_base: u32,
+}
+
+impl KSegmentContext {
+    fn for_segment(
+        segment_index: usize,
+        segment_count: usize,
+        k_segment_nonces: u32,
+        segment_start: U512,
+    ) -> Self {
+        if miner_cuda_nonce_line_env_enabled() {
+            let be = segment_start.to_big_endian();
+            Self {
+                segment_index,
+                segment_count,
+                k_segment_nonces,
+                k_index: Some(pow_core::nonce_line::k_of(&be)),
+                t_base: pow_core::nonce_line::t_of(&be),
+            }
+        } else {
+            Self {
+                segment_index,
+                segment_count,
+                k_segment_nonces,
+                k_index: None,
+                t_base: 0,
+            }
+        }
+    }
+}
+
+/// Split a GPU batch into k-segments. Flat mode: equal-sized chunks from
+/// `batch_start`. Nonce-line mode (A2): first/last chunks may be shorter so
+/// segments do not cross a `2^26` `t` boundary (pk constant within a segment).
+fn plan_k_segments_with_cap(
+    batch_start: U512,
+    batch_size: u32,
+    cap: u32,
+    nonce_line_align: bool,
+) -> Vec<(U512, u32)> {
+    if batch_size == 0 {
+        return Vec::new();
+    }
+    if cap == 0 || batch_size <= cap {
+        if nonce_line_align {
+            let room = pow_core::nonce_line::t_room_in_k(batch_start);
+            let seg_size = batch_size.min(room).max(1);
+            if seg_size < batch_size {
+                return vec![
+                    (batch_start, seg_size),
+                    (
+                        pow_core::nonce_line::counter_add_t(batch_start, seg_size),
+                        batch_size - seg_size,
+                    ),
+                ];
+            }
+        }
+        return vec![(batch_start, batch_size)];
+    }
+
+    let mut segments = Vec::new();
+    let mut offset = 0u32;
+    let mut cursor = batch_start;
+
+    while offset < batch_size {
+        let remaining = batch_size - offset;
+        let mut seg_size = remaining.min(cap);
+
+        if nonce_line_align {
+            let room_in_k = pow_core::nonce_line::t_room_in_k(cursor);
+            seg_size = seg_size.min(room_in_k).max(1);
+        }
+
+        segments.push((cursor, seg_size));
+        offset += seg_size;
+        cursor = if nonce_line_align {
+            pow_core::nonce_line::counter_add_t(cursor, seg_size)
+        } else {
+            cursor + U512::from(seg_size)
+        };
+    }
+    segments
+}
+
+fn plan_k_segments(batch_start: U512, batch_size: u32) -> Vec<(U512, u32)> {
+    plan_k_segments_with_cap(
+        batch_start,
+        batch_size,
+        cuda_k_segment_size(),
+        miner_cuda_nonce_line_env_enabled(),
+    )
+}
+
+fn mining_dispatch(segment_size: u32, seg: &KSegmentContext) -> ([u32; 3], u32, u32) {
+    let (threads_per_block, max_blocks) = cuda_launch_config();
+    let num_blocks = segment_size
+        .div_ceil(threads_per_block)
+        .clamp(1, max_blocks);
+    let total_threads = num_blocks * threads_per_block;
+    let per_thread = segment_size.div_ceil(total_threads).max(1);
+    let third = if cuda_use_nonce_line() {
+        seg.t_base.saturating_add(segment_size)
+    } else {
+        segment_size
+    };
+    let dispatch = [total_threads, per_thread, third];
+    (dispatch, num_blocks, threads_per_block)
+}
+
+fn mining_params_for_segment(
+    ctx: &JobContext,
+    segment_start: U512,
+    segment_size: u32,
+    dispatch: [u32; 3],
+    seg: &KSegmentContext,
+) -> MiningParams {
+    let counter_be = segment_start.to_big_endian();
+    let nonce_be = counter_be;
+    let start_limbs = pow_core::u512_to_le_u32s(segment_start);
+    let prestate = pow_core::mining_prestate_low64_u32s(ctx.header, nonce_be);
+    let target = pow_core::u512_to_le_u32s(ctx.target);
+    let k_base = pow_core::nonce_line::base_words(&counter_be);
+    let (pk, t_base) = if cuda_use_nonce_line() {
+        (
+            pow_core::nonce_line::segment_launch_params(ctx.header, segment_start),
+            seg.t_base,
+        )
+    } else {
+        ([0u64; 14], 0u32)
+    };
+    let _ = segment_size;
+    MiningParams {
+        prestate,
+        start_nonce: start_limbs,
+        difficulty_target: target,
+        dispatch_config: dispatch,
+        nonce_line_k_base: k_base,
+        nonce_line_v: NONCE_LINE_K_V,
+        nonce_line_pk: pk,
+        nonce_line_t_base: t_base,
+        nonce_line_pad: 0,
+    }
 }
 
 impl CudaEngine {
@@ -111,20 +377,18 @@ impl CudaEngine {
         }
 
         let mut devices = Vec::new();
-        let mut compiled: HashMap<(i32, i32), Ptx> = HashMap::new();
+        let compile_tag = nvrtc_compile_tag();
+        let mut compiled: HashMap<(i32, i32, u32), Ptx> = HashMap::new();
         for ordinal in 0..count as usize {
             let ctx = CudaContext::new(ordinal)
                 .map_err(|e| format!("Failed to create CUDA context for device {ordinal}: {e}"))?;
-            ctx.set_blocking_synchronize().map_err(|e| {
-                format!("Failed to enable blocking CUDA synchronization on device {ordinal}: {e}")
-            })?;
             let name = ctx
                 .name()
                 .unwrap_or_else(|_| format!("cuda-device-{ordinal}"));
             let (major, minor) = ctx.compute_capability().map_err(|e| {
                 format!("Failed to query compute capability of CUDA device {ordinal}: {e}")
             })?;
-            let ptx = match compiled.get(&(major, minor)) {
+            let ptx = match compiled.get(&(major, minor, compile_tag)) {
                 Some(ptx) => ptx.clone(),
                 None => {
                     let ptx = match silent_catch(|| compile_kernel(major, minor)) {
@@ -133,16 +397,17 @@ impl CudaEngine {
                             return Err("CUDA NVRTC library is not available (need libnvrtc from the CUDA toolkit)".into());
                         }
                     };
-                    compiled.insert((major, minor), ptx.clone());
+                    compiled.insert((major, minor, compile_tag), ptx.clone());
                     ptx
                 }
             };
             let module = ctx
                 .load_module(ptx)
                 .map_err(|e| format!("Failed to load CUDA mining module on {name}: {e}"))?;
+            let kernel = mining_kernel_name();
             let mine = module
-                .load_function("mining_main")
-                .map_err(|e| format!("Failed to load mining_main on {name}: {e}"))?;
+                .load_function(kernel)
+                .map_err(|e| format!("Failed to load {kernel} on {name}: {e}"))?;
             let (regs, local, shared, constant) = (
                 mine.num_regs()?,
                 mine.local_size_bytes()?,
@@ -151,12 +416,12 @@ impl CudaEngine {
             );
             log::info!(
                 target: "cuda_engine",
-                "CUDA device {ordinal}: {name} (sm_{major}{minor}; mining_main uses {regs} registers, {local} B local, {shared} B shared, {constant} B constant)"
+                "CUDA device {ordinal}: {name} (sm_{major}{minor}; {kernel} uses {regs} registers, {local} B local, {shared} B shared, {constant} B constant)"
             );
             if local > 0 {
                 log::warn!(
                     target: "cuda_engine",
-                    "mining_main spills {local} bytes per thread to local memory on {name}"
+                    "{kernel} spills {local} bytes per thread to local memory on {name}"
                 );
             }
             devices.push(Arc::new(CudaDevice { ctx, module, name }));
@@ -167,6 +432,12 @@ impl CudaEngine {
             "CUDA engine initialized with {} device(s) (batch size: {batch_size} nonces, throttle: {throttle_ms}ms)",
             devices.len()
         );
+        if cuda_use_nonce_line() {
+            log::info!(
+                target: "cuda_engine",
+                "MINER_CUDA_NONCE_LINE=1: using mining_main_nonce_line with host pk[14] per k-segment and (k,t) CPU verify"
+            );
+        }
 
         Ok(Self {
             engine_id: ENGINE_ID_COUNTER.fetch_add(1, Ordering::SeqCst),
@@ -216,10 +487,11 @@ impl CudaEngine {
             .stream
             .memcpy_htod(&start_limbs, &mut buffers.start_nonce)?;
 
-        let num_blocks = count.div_ceil(THREADS_PER_BLOCK).max(1);
+        let (threads_per_block, _) = cuda_launch_config();
+        let num_blocks = count.div_ceil(threads_per_block).max(1);
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            block_dim: (threads_per_block, 1, 1),
             shared_mem_bytes: 0,
         };
         let mut builder = buffers.stream.launch_builder(&buffers.hash);
@@ -230,7 +502,6 @@ impl CudaEngine {
         unsafe {
             builder.launch(cfg)?;
         }
-        buffers.stream.synchronize()?;
         let raw = buffers.stream.clone_dtoh(&buffers.hashes)?;
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count as usize {
@@ -254,26 +525,71 @@ fn nvrtc_supported_archs() -> Result<Vec<i32>, String> {
     Ok(archs)
 }
 
+fn nvrtc_version() -> Result<(i32, i32), String> {
+    let (mut major, mut minor) = (0i32, 0i32);
+    unsafe { nvrtc_sys::nvrtcVersion(&mut major, &mut minor) }
+        .result()
+        .map_err(|e| format!("nvrtcVersion failed: {e:?}"))?;
+    Ok((major, minor))
+}
+
 /// Compiles PTX for the newest virtual architecture NVRTC knows that the device
 /// can run. The driver JIT then emits native code; on a 4090 that measured
 /// equal to loading NVRTC's own cubin, so the PTX route is kept.
 fn compile_kernel(major: i32, minor: i32) -> Result<Ptx, Box<dyn std::error::Error>> {
     let device_arch = major * 10 + minor;
-    let target = nvrtc_supported_archs()?
-        .into_iter()
-        .filter(|&arch| arch <= device_arch)
-        .max()
-        .ok_or_else(|| format!("NVRTC supports no architecture at or below sm_{device_arch}"))?;
+    let (nv_major, nv_minor) = nvrtc_version().unwrap_or((0, 0));
+    let supported = nvrtc_supported_archs().unwrap_or_default();
+    log::info!(
+        target: "cuda_engine",
+        "NVRTC {}.{} supported arches: {:?}",
+        nv_major,
+        nv_minor,
+        supported
+    );
+    let target = if let Ok(raw) = std::env::var("MINER_CUDA_PTX_ARCH") {
+        let forced: i32 = raw
+            .parse()
+            .map_err(|_| "MINER_CUDA_PTX_ARCH must be an integer (e.g. 120)")?;
+        log::warn!(
+            target: "cuda_engine",
+            "MINER_CUDA_PTX_ARCH={forced} overrides NVRTC arch selection for sm_{device_arch}"
+        );
+        forced
+    } else {
+        supported
+            .iter()
+            .copied()
+            .filter(|&arch| arch <= device_arch)
+            .max()
+            .ok_or_else(|| {
+                format!("NVRTC supports no architecture at or below sm_{device_arch}; supported={supported:?}")
+            })?
+    };
     if target != device_arch {
         log::warn!(
             target: "cuda_engine",
-            "NVRTC does not know sm_{device_arch}; compiling PTX for compute_{target} instead"
+            "NVRTC does not know sm_{device_arch}; compiling PTX for compute_{target} instead (install CUDA 12.8+ libnvrtc on the host)"
         );
     }
-    let opts = CompileOptions {
-        options: vec![format!("--gpu-architecture=compute_{target}")],
-        ..Default::default()
-    };
+    let gf64_32bit = cuda_gf64_32bit_flag();
+    log::info!(
+        target: "cuda_engine",
+        "GF64 add/nonce coeff chains: MINER_CUDA_GF64_32BIT={gf64_32bit} (1=32-bit PTX/coeffs, 0=64-bit reference)"
+    );
+    if cuda_ext_v2_enabled() {
+        log::info!(
+            target: "cuda_engine",
+            "MINER_CUDA_EXT_V2=1: NVRTC ext_layer64 pass-2 fully unrolled"
+        );
+    }
+    if cuda_lazy_carry_enabled() {
+        log::info!(
+            target: "cuda_engine",
+            "MINER_CUDA_LAZY_CARRY=1: gf64_add_lazy on nonce/t absorb (#110 item 3)"
+        );
+    }
+    let opts = nvrtc_compile_options(target);
     let ptx = compile_ptx_with_opts(KERNEL_SRC, opts).map_err(|e| {
         format!("NVRTC failed to compile the CUDA mining kernel for compute_{target}: {e}")
     })?;
@@ -282,6 +598,47 @@ fn compile_kernel(major: i32, minor: i32) -> Result<Ptx, Box<dyn std::error::Err
         "Compiled CUDA mining kernel PTX for compute_{target} (device sm_{device_arch}); the driver JIT emits native code"
     );
     Ok(ptx)
+}
+
+fn cuda_kernel_include_dir() -> String {
+    std::env::var("MINER_CUDA_KERNEL_DIR").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernels").to_string()
+    })
+}
+
+fn cuda_gf64_32bit_flag() -> i32 {
+    match std::env::var("MINER_CUDA_GF64_32BIT").as_deref() {
+        Ok("0") => 0,
+        Ok("1") | Ok("") => 1,
+        Ok(other) => {
+            log::warn!(
+                target: "cuda_engine",
+                "MINER_CUDA_GF64_32BIT={other} invalid; use 0 or 1 (default 1)"
+            );
+            1
+        }
+        Err(_) => 1,
+    }
+}
+
+fn nvrtc_compile_options(gpu_arch: i32) -> CompileOptions {
+    let kernel_dir = cuda_kernel_include_dir();
+    let gf64_32bit = cuda_gf64_32bit_flag();
+    let mut options = vec![
+        format!("--gpu-architecture=compute_{gpu_arch}"),
+        format!("-I{kernel_dir}"),
+        format!("-DMINER_CUDA_GF64_32BIT={gf64_32bit}"),
+    ];
+    if cuda_ext_v2_enabled() {
+        options.push("-DMINER_CUDA_EXT_V2".into());
+    }
+    if cuda_lazy_carry_enabled() {
+        options.push("-DMINER_CUDA_LAZY_CARRY=1".into());
+    }
+    CompileOptions {
+        options,
+        ..Default::default()
+    }
 }
 
 fn silent_catch<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
@@ -302,7 +659,7 @@ fn create_buffers(
     hash_capacity: u32,
 ) -> Result<WorkerBuffers, Box<dyn std::error::Error>> {
     let stream = device.ctx.default_stream();
-    let mine = device.module.load_function("mining_main")?;
+    let mine = device.module.load_function(mining_kernel_name())?;
     let hash = device.module.load_function("hash_nonces")?;
     Ok(WorkerBuffers {
         engine_id,
@@ -313,10 +670,172 @@ fn create_buffers(
         hashes: stream.alloc_zeros::<u32>(hash_capacity.max(1) as usize * 16)?,
         mine,
         hash,
-        stream,
+        stream: stream.clone(),
         busy: Duration::ZERO,
         busy_since: Instant::now(),
+        params_dev: [
+            stream.alloc_zeros::<MiningParams>(1)?,
+            stream.alloc_zeros::<MiningParams>(1)?,
+        ],
+        params_h2d_ready: [None, None],
+        copy_stream: None,
+        param_slot: 0,
+        staged_first_segment: None,
     })
+}
+
+fn ensure_pipeline_resources(
+    buffers: &mut WorkerBuffers,
+    device: &CudaDevice,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if buffers.copy_stream.is_some() {
+        return Ok(());
+    }
+    let copy_stream = device.ctx.new_stream()?;
+    buffers.copy_stream = Some(copy_stream);
+    Ok(())
+}
+
+fn wait_params_h2d(buffers: &WorkerBuffers, slot: usize) -> Result<(), BatchResult> {
+    if let Some(event) = buffers.params_h2d_ready[slot].as_ref() {
+        event.synchronize().map_err(|e| {
+            log::error!(target: "cuda_engine", "CUDA params H2D wait failed: {e}");
+            BatchResult::DeviceLost
+        })?;
+    }
+    Ok(())
+}
+
+fn upload_params_sync(
+    buffers: &mut WorkerBuffers,
+    params: &MiningParams,
+    slot: usize,
+) -> Result<(), BatchResult> {
+    buffers.params_h2d_ready[slot] = None;
+    buffers.stream.memcpy_htod(std::slice::from_ref(params), &mut buffers.params_dev[slot]).map_err(|e| {
+        log::error!(target: "cuda_engine", "CUDA params upload failed: {e}");
+        BatchResult::DeviceLost
+    })?;
+    Ok(())
+}
+
+fn upload_params_async(
+    buffers: &mut WorkerBuffers,
+    params: &MiningParams,
+    slot: usize,
+) -> Result<(), BatchResult> {
+    let copy = buffers
+        .copy_stream
+        .as_ref()
+        .expect("pipeline copy stream");
+    copy.memcpy_htod(std::slice::from_ref(params), &mut buffers.params_dev[slot])
+        .map_err(|e| {
+            log::error!(target: "cuda_engine", "CUDA async params upload failed: {e}");
+            BatchResult::DeviceLost
+        })?;
+    let event = copy.record_event(None).map_err(|e| {
+        log::error!(target: "cuda_engine", "CUDA params H2D event failed: {e}");
+        BatchResult::DeviceLost
+    })?;
+    buffers.params_h2d_ready[slot] = Some(event);
+    Ok(())
+}
+
+fn launch_mining_kernel(
+    buffers: &mut WorkerBuffers,
+    param_slot: usize,
+    num_blocks: u32,
+    threads_per_block: u32,
+    wait_copy_stream: bool,
+) -> Result<(), BatchResult> {
+    if wait_copy_stream {
+        if let Some(event) = buffers.params_h2d_ready[param_slot].as_ref() {
+            buffers.stream.wait(event).map_err(|e| {
+                log::error!(target: "cuda_engine", "CUDA stream wait on params H2D failed: {e}");
+                BatchResult::DeviceLost
+            })?;
+        }
+        buffers.params_h2d_ready[param_slot] = None;
+    }
+
+    let launch_start = Instant::now();
+    let result = (|| {
+        buffers.stream.memset_zeros(&mut buffers.results)?;
+        let cfg = LaunchConfig {
+            grid_dim: (num_blocks, 1, 1),
+            block_dim: (threads_per_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = buffers.stream.launch_builder(&buffers.mine);
+        builder.arg(&mut buffers.results);
+        builder.arg(&buffers.params_dev[param_slot]);
+        unsafe {
+            builder.launch(cfg)?;
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })();
+    buffers.busy += launch_start.elapsed();
+    result.map_err(|e| {
+        log::error!(target: "cuda_engine", "CUDA segment launch failed: {e}");
+        BatchResult::DeviceLost
+    })
+}
+
+fn process_segment_hits(
+    result_u32s: &[u32],
+    segment_start: U512,
+    ctx: &JobContext,
+    seg: &KSegmentContext,
+    dispatched: u64,
+) -> Result<Option<(U512, U512)>, BatchResult> {
+    let hits = result_u32s[0] as usize;
+    if hits > MAX_HITS {
+        log::warn!(
+            target: "cuda_engine",
+            "CUDA launch produced {hits} candidates, only {MAX_HITS} were recorded; the rest are skipped"
+        );
+    }
+    let mut best: Option<(U512, U512)> = None;
+    let t_end = seg.t_base.saturating_add(seg.k_segment_nonces);
+    for &index in &result_u32s[1..=hits.min(MAX_HITS)] {
+        let nonce = if cuda_use_nonce_line() {
+            let t_abs = index;
+            if t_abs < seg.t_base || t_abs >= t_end {
+                log::error!(
+                    target: "cuda_engine",
+                    "CUDA returned out-of-range nonce-line t={t_abs} (segment t in [{}, {t_end}))",
+                    seg.t_base
+                );
+                return Err(BatchResult::DeviceLost);
+            }
+            pow_core::nonce_line::nonce_from_absolute_t(segment_start, t_abs)
+        } else {
+            let logical_index = index as u64;
+            if logical_index >= dispatched {
+                log::error!(
+                    target: "cuda_engine",
+                    "CUDA returned out-of-range candidate index {logical_index} for {dispatched} dispatched nonces"
+                );
+                return Err(BatchResult::DeviceLost);
+            }
+            segment_start + U512::from(logical_index)
+        };
+        let hash = pow_core::hash_from_nonce(ctx, nonce);
+        if hash >= ctx.target {
+            log::warn!(
+                target: "cuda_engine",
+                "CUDA candidate {} rejected by CPU verification (hash {} >= target {})",
+                format_u512(nonce),
+                format_u512(hash),
+                format_u512(ctx.target)
+            );
+            continue;
+        }
+        if best.is_none_or(|(n, _)| nonce < n) {
+            best = Some((nonce, hash));
+        }
+    }
+    Ok(best)
 }
 
 fn take_gpu_duty_cycle(buffers: &mut WorkerBuffers) -> Option<f64> {
@@ -365,102 +884,283 @@ fn nonces_until_low64_carry(nonce: U512) -> U512 {
     (U512::one() << 64).saturating_sub(U512::from(nonce.low_u64()))
 }
 
-fn run_single_batch(
+fn run_mining_segment(
     buffers: &mut WorkerBuffers,
     ctx: &JobContext,
-    batch_start: U512,
-    batch_size: u32,
-) -> BatchResult {
-    let num_blocks = batch_size.div_ceil(THREADS_PER_BLOCK).clamp(1, MAX_BLOCKS);
-    let total_threads = num_blocks * THREADS_PER_BLOCK;
-    let nonces_per_thread = batch_size.div_ceil(total_threads).max(1);
-    let dispatch = [total_threads, nonces_per_thread, batch_size];
-    let nonce_be = batch_start.to_big_endian();
-    let start_limbs = pow_core::u512_to_le_u32s(batch_start);
-    let prestate = pow_core::mining_prestate_low64_u32s(ctx.header, nonce_be);
-    let target = pow_core::u512_to_le_u32s(ctx.target);
-    let params = MiningParams {
-        prestate,
-        start_nonce: start_limbs,
-        difficulty_target: target,
-        dispatch_config: dispatch,
-    };
+    segment_start: U512,
+    segment_size: u32,
+    seg_ctx: &KSegmentContext,
+) -> Result<(Option<(U512, U512)>, u64), BatchResult> {
+    let (dispatch, num_blocks, threads_per_block) = mining_dispatch(segment_size, seg_ctx);
+    let total_threads = dispatch[0];
+    let nonces_per_thread = dispatch[1];
+    let params = mining_params_for_segment(ctx, segment_start, segment_size, dispatch, seg_ctx);
 
-    let launch_start = Instant::now();
-    if let Err(e) = (|| {
-        buffers.stream.memset_zeros(&mut buffers.results)?;
-        let cfg = LaunchConfig {
-            grid_dim: (num_blocks, 1, 1),
-            block_dim: (THREADS_PER_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = buffers.stream.launch_builder(&buffers.mine);
-        builder.arg(&mut buffers.results);
-        builder.arg(&params);
-        unsafe {
-            builder.launch(cfg)?;
-        }
-        buffers.stream.synchronize()?;
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })() {
-        log::error!(target: "cuda_engine", "CUDA batch failed: {e}");
-        return BatchResult::DeviceLost;
-    }
-    buffers.busy += launch_start.elapsed();
+    upload_params_sync(buffers, &params, 0)?;
+    launch_mining_kernel(buffers, 0, num_blocks, threads_per_block, false)?;
 
     let result_u32s = match buffers.stream.clone_dtoh(&buffers.results) {
         Ok(v) => v,
         Err(e) => {
             log::error!(target: "cuda_engine", "CUDA result copy failed: {e}");
-            return BatchResult::DeviceLost;
+            return Err(BatchResult::DeviceLost);
         }
     };
 
-    let dispatched = (total_threads as u64 * nonces_per_thread as u64).min(batch_size as u64);
-    let hits = result_u32s[0] as usize;
-    if hits > MAX_HITS {
-        log::warn!(
+    let dispatched =
+        (total_threads as u64 * nonces_per_thread as u64).min(segment_size as u64);
+    let best = process_segment_hits(&result_u32s, segment_start, ctx, seg_ctx, dispatched)?;
+    Ok((best, dispatched))
+}
+
+fn stage_first_segment_params(
+    buffers: &mut WorkerBuffers,
+    ctx: &JobContext,
+    batch_start: U512,
+    batch_size: u32,
+) -> Result<(), BatchResult> {
+    let segments = plan_k_segments(batch_start, batch_size);
+    let Some((segment_start, segment_size)) = segments.first().copied() else {
+        return Ok(());
+    };
+    let seg_ctx = KSegmentContext::for_segment(0, segments.len(), segment_size, segment_start);
+    let (dispatch, _, _) = mining_dispatch(segment_size, &seg_ctx);
+    let params = mining_params_for_segment(ctx, segment_start, segment_size, dispatch, &seg_ctx);
+    let slot = 1usize - buffers.param_slot as usize;
+    upload_params_async(buffers, &params, slot)?;
+    buffers.staged_first_segment = Some(StagedSegmentParams {
+        batch_start,
+        slot: slot as u8,
+    });
+    Ok(())
+}
+
+fn run_single_batch_pipelined(
+    buffers: &mut WorkerBuffers,
+    device: &CudaDevice,
+    ctx: &JobContext,
+    batch_start: U512,
+    batch_size: u32,
+    next_batch: Option<(U512, u32)>,
+) -> BatchResult {
+    if let Err(e) = ensure_pipeline_resources(buffers, device) {
+        log::error!(target: "cuda_engine", "CUDA pipeline setup failed: {e}");
+        return BatchResult::DeviceLost;
+    }
+
+    let segments = plan_k_segments(batch_start, batch_size);
+    let segment_count = segments.len();
+    if segment_count > 1 {
+        log::debug!(
             target: "cuda_engine",
-            "CUDA launch produced {hits} candidates, only {MAX_HITS} were recorded; the rest are skipped"
+            "pipeline k-segment batch {}..+{} → {segment_count} launches",
+            format_u512(batch_start),
+            batch_size
         );
     }
-    let mut best: Option<(U512, U512)> = None;
-    for &index in &result_u32s[1..=hits.min(MAX_HITS)] {
-        let logical_index = index as u64;
-        if logical_index >= dispatched {
-            log::error!(
-                target: "cuda_engine",
-                "CUDA returned out-of-range candidate index {logical_index} for {dispatched} dispatched nonces"
-            );
-            return BatchResult::DeviceLost;
+
+    let mut total_dispatched = 0u64;
+    let mut batch_best: Option<(U512, U512)> = None;
+
+    for (segment_index, (segment_start, segment_size)) in segments.iter().copied().enumerate() {
+        let seg_ctx =
+            KSegmentContext::for_segment(segment_index, segment_count, segment_size, segment_start);
+        let (dispatch, num_blocks, threads_per_block) = mining_dispatch(segment_size, &seg_ctx);
+        let total_threads = dispatch[0];
+        let nonces_per_thread = dispatch[1];
+
+        let slot = if segment_index == 0 {
+            if let Some(staged) = buffers.staged_first_segment.take() {
+                if staged.batch_start == batch_start {
+                    buffers.param_slot = staged.slot;
+                    if let Err(e) = wait_params_h2d(buffers, staged.slot as usize) {
+                        return e;
+                    }
+                    buffers.params_h2d_ready[staged.slot as usize] = None;
+                    staged.slot as usize
+                } else {
+                    let params = mining_params_for_segment(
+                        ctx,
+                        segment_start,
+                        segment_size,
+                        dispatch,
+                        &seg_ctx,
+                    );
+                    if let Err(e) = upload_params_sync(buffers, &params, 0) {
+                        return e;
+                    }
+                    0
+                }
+            } else {
+                let params = mining_params_for_segment(
+                    ctx,
+                    segment_start,
+                    segment_size,
+                    dispatch,
+                    &seg_ctx,
+                );
+                if let Err(e) = upload_params_sync(buffers, &params, 0) {
+                    return e;
+                }
+                0
+            }
+        } else {
+            buffers.param_slot as usize
+        };
+
+        if let Err(e) = launch_mining_kernel(buffers, slot, num_blocks, threads_per_block, segment_index > 0)
+        {
+            return e;
         }
-        let nonce = batch_start + U512::from(logical_index);
-        let hash = pow_core::hash_from_nonce(ctx, nonce);
-        if hash >= ctx.target {
-            log::warn!(
-                target: "cuda_engine",
-                "CUDA candidate {} rejected by CPU verification (hash {} >= target {})",
-                format_u512(nonce),
-                format_u512(hash),
-                format_u512(ctx.target)
+
+        let next_segment = segments.get(segment_index + 1).copied();
+        let next_params = next_segment.map(|(next_start, next_size)| {
+            let next_ctx = KSegmentContext::for_segment(
+                segment_index + 1,
+                segment_count,
+                next_size,
+                next_start,
             );
-            continue;
+            let (next_dispatch, _, _) = mining_dispatch(next_size, &next_ctx);
+            mining_params_for_segment(ctx, next_start, next_size, next_dispatch, &next_ctx)
+        });
+
+        if let Some(params) = next_params.as_ref() {
+            let next_slot = 1usize - slot;
+            if let Err(e) = upload_params_async(buffers, params, next_slot) {
+                return e;
+            }
+            buffers.param_slot = next_slot as u8;
         }
-        if best.is_none_or(|(n, _)| nonce < n) {
-            best = Some((nonce, hash));
+
+        let result_u32s = match buffers.stream.clone_dtoh(&buffers.results) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(target: "cuda_engine", "CUDA result copy failed: {e}");
+                return BatchResult::DeviceLost;
+            }
+        };
+
+        let dispatched =
+            (total_threads as u64 * nonces_per_thread as u64).min(segment_size as u64);
+        match process_segment_hits(&result_u32s, segment_start, ctx, &seg_ctx, dispatched) {
+            Ok(best) => {
+                total_dispatched += dispatched;
+                if let Some((nonce, hash)) = best {
+                    if batch_best.is_none_or(|(n, _)| nonce < n) {
+                        batch_best = Some((nonce, hash));
+                    }
+                }
+            }
+            Err(device_lost) => return device_lost,
         }
     }
-    match best {
+
+    if let Some((next_start, next_size)) = next_batch {
+        if let Err(e) = stage_first_segment_params(buffers, ctx, next_start, next_size) {
+            return e;
+        }
+    }
+
+    match batch_best {
         Some((nonce, hash)) => BatchResult::Found {
             candidate: Candidate {
                 nonce,
                 work: nonce.to_big_endian(),
                 hash,
             },
-            hash_count: dispatched,
+            hash_count: total_dispatched,
         },
         None => BatchResult::NotFound {
-            hash_count: dispatched,
+            hash_count: total_dispatched,
+        },
+    }
+}
+
+fn batch_size_for_start(
+    range: &Range,
+    current_start: U512,
+    engine_batch_size: u32,
+) -> u32 {
+    let remaining = range
+        .end
+        .saturating_sub(current_start)
+        .saturating_add(U512::one());
+    let headroom = nonces_until_low64_carry(current_start);
+    let cap = remaining.min(headroom);
+    let batch_size_u512 = U512::from(engine_batch_size);
+    if cap > batch_size_u512 {
+        engine_batch_size
+    } else {
+        cap.low_u32()
+    }
+}
+
+fn run_single_batch(
+    buffers: &mut WorkerBuffers,
+    device: Option<&CudaDevice>,
+    ctx: &JobContext,
+    batch_start: U512,
+    batch_size: u32,
+    next_batch: Option<(U512, u32)>,
+) -> BatchResult {
+    if cuda_pipeline_enabled() {
+        let Some(device) = device else {
+            log::error!(target: "cuda_engine", "pipeline mode requires CUDA device handle");
+            return BatchResult::DeviceLost;
+        };
+        return run_single_batch_pipelined(
+            buffers,
+            device,
+            ctx,
+            batch_start,
+            batch_size,
+            next_batch,
+        );
+    }
+
+    let segments = plan_k_segments(batch_start, batch_size);
+    let segment_count = segments.len();
+    if segment_count > 1 {
+        log::debug!(
+            target: "cuda_engine",
+            "k-segment batch {}..+{} split into {segment_count} launches (MINER_CUDA_K_SEGMENT={})",
+            format_u512(batch_start),
+            batch_size,
+            cuda_k_segment_size()
+        );
+    }
+
+    let mut total_dispatched = 0u64;
+    let mut batch_best: Option<(U512, U512)> = None;
+
+    for (segment_index, (segment_start, segment_size)) in segments.into_iter().enumerate() {
+        let seg_ctx =
+            KSegmentContext::for_segment(segment_index, segment_count, segment_size, segment_start);
+        match run_mining_segment(buffers, ctx, segment_start, segment_size, &seg_ctx) {
+            Ok((best, dispatched)) => {
+                total_dispatched += dispatched;
+                if let Some((nonce, hash)) = best {
+                    if batch_best.is_none_or(|(n, _)| nonce < n) {
+                        batch_best = Some((nonce, hash));
+                    }
+                }
+            }
+            Err(device_lost) => return device_lost,
+        }
+    }
+
+    match batch_best {
+        Some((nonce, hash)) => BatchResult::Found {
+            candidate: Candidate {
+                nonce,
+                work: nonce.to_big_endian(),
+                hash,
+            },
+            hash_count: total_dispatched,
+        },
+        None => BatchResult::NotFound {
+            hash_count: total_dispatched,
         },
     }
 }
@@ -537,14 +1237,20 @@ impl MinerEngine for CudaEngine {
                     .expect("CUDA buffers initialized"),
             )
         });
+        let pipeline = cuda_pipeline_enabled();
         log::info!(
             target: "cuda_engine",
-            "CUDA device {} search started: range {}..{}, batch size: {} nonces{}",
+            "CUDA device {} search started: range {}..{}, batch size: {} nonces{}{}",
             device_index,
             format_u512(range.start),
             format_u512(range.end),
             self.batch_size,
-            duty.map_or(String::new(), |d| format!(", GPU busy {d:.1}% since previous search"))
+            duty.map_or(String::new(), |d| format!(", GPU busy {d:.1}% since previous search")),
+            if pipeline {
+                ", host/GPU pipeline ON (MINER_CUDA_PIPELINE=1)"
+            } else {
+                ""
+            }
         );
 
         while current_start <= range.end {
@@ -554,23 +1260,27 @@ impl MinerEngine for CudaEngine {
                 };
             }
 
-            let remaining = range
-                .end
-                .saturating_sub(current_start)
-                .saturating_add(U512::one());
-            let headroom = nonces_until_low64_carry(current_start);
-            let cap = remaining.min(headroom);
-            let batch_size_u512 = U512::from(self.batch_size);
-            let this_batch_size: u32 = if cap > batch_size_u512 {
-                self.batch_size
-            } else {
-                cap.low_u32()
-            };
+            let this_batch_size =
+                batch_size_for_start(&range, current_start, self.batch_size);
+            let next_start = current_start.saturating_add(U512::from(this_batch_size));
+            let next_batch = (next_start <= range.end).then(|| {
+                (
+                    next_start,
+                    batch_size_for_start(&range, next_start, self.batch_size),
+                )
+            });
 
             let batch_result = WORKER_BUFFERS.with(|cell| {
                 let mut slot = cell.borrow_mut();
                 let buffers = slot.as_mut().expect("CUDA buffers initialized");
-                run_single_batch(buffers, ctx, current_start, this_batch_size)
+                run_single_batch(
+                    buffers,
+                    Some(&self.devices[device_index]),
+                    ctx,
+                    current_start,
+                    this_batch_size,
+                    next_batch,
+                )
             });
 
             match batch_result {
@@ -639,10 +1349,55 @@ impl MinerEngine for CudaEngine {
 
 #[cfg(test)]
 mod tests {
+    //! CUDA correctness tests for `mining_main` / `hash_nonces` vs `pow_core`.
+    //!
+    //! **Golden vectors:** `pow_core::NONCE_HASH_KVS` in `crates/pow-core/src/lib.rs`
+    //! (five header/nonce/hash/midstate fixtures). They are regression anchors for
+    //! `qpow_math::get_nonce_hash` in `pow-core` (`nonce_hash_golden_vectors`,
+    //! `test_hash_matches_qpow_math`); keep them bit-stable when editing kernels.
+
     use super::*;
-    use cudarc::nvrtc::compile_ptx;
+    use cudarc::nvrtc::compile_ptx_with_opts;
     use engine_cpu::AtomicBoolCancelCheck;
     use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_isolated_cuda_env(vars: &[(&str, &str)], f: impl FnOnce()) {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["MINER_CUDA_NONCE_LINE", "MINER_CUDA_K_SEGMENT"];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        unsafe {
+            for k in keys {
+                std::env::remove_var(k);
+            }
+        }
+        for (k, v) in vars {
+            unsafe {
+                std::env::set_var(k, v);
+            }
+        }
+        f();
+        unsafe {
+            for k in keys {
+                std::env::remove_var(k);
+            }
+        }
+        for (k, prev) in saved {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => {}
+                }
+            }
+        }
+    }
 
     fn decode32(s: &str) -> [u8; 32] {
         hex::decode(s).unwrap().try_into().unwrap()
@@ -669,6 +1424,116 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn k_segment_plan_single_when_batch_fits() {
+        with_isolated_cuda_env(&[], || {
+            let start = U512::from(0x1000u64);
+            let segs = plan_k_segments(start, DEFAULT_K_SEGMENT);
+            assert_eq!(segs.len(), 1);
+            assert_eq!(segs[0], (start, DEFAULT_K_SEGMENT));
+
+            let small = plan_k_segments(start, 1024);
+            assert_eq!(small, vec![(start, 1024)]);
+        });
+    }
+
+    #[test]
+    fn k_segment_plan_splits_large_batch() {
+        with_isolated_cuda_env(&[], || {
+            let start = U512::from(42u64);
+            let batch = DEFAULT_K_SEGMENT + 1000;
+            let segs = plan_k_segments(start, batch);
+            assert_eq!(segs.len(), 2);
+            assert_eq!(segs[0], (start, DEFAULT_K_SEGMENT));
+            assert_eq!(segs[1], (start + U512::from(DEFAULT_K_SEGMENT), 1000));
+        });
+    }
+
+    #[test]
+    fn miner_cuda_nonce_line_env_parsing() {
+        with_isolated_cuda_env(&[], || {
+            assert!(!miner_cuda_nonce_line_env_enabled());
+        });
+        with_isolated_cuda_env(&[("MINER_CUDA_NONCE_LINE", "1")], || {
+            assert!(miner_cuda_nonce_line_env_enabled());
+        });
+        with_isolated_cuda_env(&[("MINER_CUDA_NONCE_LINE", "true")], || {
+            assert!(miner_cuda_nonce_line_env_enabled());
+        });
+    }
+
+    #[test]
+    fn k_segment_plan_nonce_line_shortens_first_segment_at_boundary() {
+        let start = U512::from(900u64);
+        let cap = 1024u32;
+        let batch = 2048u32;
+        let segs = plan_k_segments_with_cap(start, batch, cap, true);
+        let mut cursor = start;
+        let mut rem = batch;
+        let mut expected = Vec::new();
+        while rem > 0 {
+            let room = pow_core::nonce_line::t_room_in_k(cursor);
+            let sz = rem.min(cap).min(room).max(1);
+            expected.push((cursor, sz));
+            rem -= sz;
+            cursor = pow_core::nonce_line::counter_add_t(cursor, sz);
+        }
+        assert_eq!(segs, expected);
+        assert!(segs.len() >= 2);
+    }
+
+    #[test]
+    fn cuda_default_mining_main_hash_nonces_match_pow_core_samples() {
+        let Some(engine) = engine_or_skip() else {
+            return;
+        };
+        for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+            let header = decode32(v.header);
+            let ctx = engine.prepare_context(header, U512::one());
+            let start = U512::from_big_endian(&decode64(v.nonce));
+            let count = 33u32;
+            let gpu = engine
+                .hash_nonces(header, start, count)
+                .unwrap_or_else(|e| panic!("kv {i}: hash_nonces failed: {e}"));
+            assert_eq!(gpu.len(), count as usize);
+            for (j, hash) in gpu.into_iter().enumerate() {
+                let nonce = start + U512::from(j);
+                assert_eq!(
+                    hash,
+                    pow_core::hash_from_nonce(&ctx, nonce),
+                    "kv {i} offset {j}"
+                );
+            }
+        }
+        CudaEngine::clear_worker_resources();
+    }
+
+    #[test]
+    fn cuda_mining_main_search_multisegment_exhausted_matches_pow_core_count() {
+        let Some(engine) = engine_or_skip_with(3000) else {
+            return;
+        };
+        with_isolated_cuda_env(&[("MINER_CUDA_K_SEGMENT", "1000")], || {
+        let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
+        let ctx = JobContext {
+            header,
+            difficulty: U512::one(),
+            target: U512::zero(),
+        };
+        let start = U512::from(0x5000u64);
+        let span = 2500u64;
+        let end = start + U512::from(span - 1);
+        let cancel = AtomicBool::new(false);
+        match engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)) {
+            EngineStatus::Exhausted { hash_count } => {
+                assert_eq!(hash_count, span);
+            }
+            other => panic!("expected Exhausted over k-segment batch, got {other:?}"),
+        }
+        });
+        CudaEngine::clear_worker_resources();
     }
 
     #[test]
@@ -923,9 +1788,13 @@ mod tests {
              }}"
         );
         let device = &engine.devices[0];
+        let (major, minor) = device.ctx.compute_capability().unwrap();
+        let arch = major * 10 + minor;
         let module = device
             .ctx
-            .load_module(compile_ptx(source).unwrap())
+            .load_module(
+                compile_ptx_with_opts(&source, nvrtc_compile_options(arch)).unwrap(),
+            )
             .unwrap();
         let function = module.load_function("arith_test").unwrap();
         let stream = device.ctx.default_stream();
@@ -1068,5 +1937,83 @@ mod tests {
             other => panic!("expected Found, got {other:?}"),
         }
         CudaEngine::clear_worker_resources();
+    }
+
+    #[test]
+    fn cuda_nonce_line_mining_main_matches_pow_core_golden_vectors() {
+        with_isolated_cuda_env(&[("MINER_CUDA_NONCE_LINE", "1")], || {
+            let Some(engine) = engine_or_skip() else {
+                eprintln!("skipping CUDA nonce-line golden test: no CUDA device");
+                return;
+            };
+            if !miner_cuda_nonce_line_kernel_ready() {
+                eprintln!("skipping CUDA nonce-line golden test: kernel not ready");
+                return;
+            }
+            for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+                let header = decode32(v.header);
+                let nonce = U512::from_big_endian(&decode64(v.nonce));
+                let want = U512::from_big_endian(&decode64(v.hash));
+                let got = engine
+                    .hash_nonces(header, nonce, 1)
+                    .unwrap_or_else(|e| panic!("kv {i}: nonce-line hash_nonces failed: {e}"));
+                assert_eq!(got[0], want, "kv {i}: nonce-line CUDA hash != golden");
+            }
+            CudaEngine::clear_worker_resources();
+        });
+    }
+
+    /// With `MINER_CUDA_NONCE_LINE` set, skip gracefully when CUDA is absent.
+    #[test]
+    fn cuda_nonce_line_stub_skips_without_gpu() {
+        with_isolated_cuda_env(&[("MINER_CUDA_NONCE_LINE", "1")], || {
+            let Some(engine) = engine_or_skip() else {
+                eprintln!("skipping CUDA nonce-line test: CUDA driver/device unavailable");
+                return;
+            };
+            if !miner_cuda_nonce_line_kernel_ready() {
+                eprintln!("skipping CUDA nonce-line test: kernel path not compiled (A1 pending)");
+                CudaEngine::clear_worker_resources();
+                return;
+            }
+            let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
+            let ctx = engine.prepare_context(header, U512::one());
+            let start = U512::from(7u64);
+            let gpu = engine
+                .hash_nonces(header, start, 4)
+                .expect("nonce-line hash path");
+            for (j, hash) in gpu.into_iter().enumerate() {
+                assert_eq!(
+                    hash,
+                    pow_core::hash_from_nonce(&ctx, start + U512::from(j)),
+                );
+            }
+            CudaEngine::clear_worker_resources();
+        });
+    }
+
+    #[test]
+    fn cuda_nonce_line_host_plan_with_env_no_gpu_required() {
+        with_isolated_cuda_env(
+            &[("MINER_CUDA_NONCE_LINE", "1"), ("MINER_CUDA_K_SEGMENT", "1024")],
+            || {
+                assert!(miner_cuda_nonce_line_env_enabled());
+                let start = U512::from(1000u64);
+                let cap = 1024u32;
+                let batch = 1500u32;
+                let segs = plan_k_segments_with_cap(start, batch, cap, true);
+                let mut cursor = start;
+                let mut rem = batch;
+                let mut expected = Vec::new();
+                while rem > 0 {
+                    let room = pow_core::nonce_line::t_room_in_k(cursor);
+                    let sz = rem.min(cap).min(room).max(1);
+                    expected.push((cursor, sz));
+                    rem -= sz;
+                    cursor = pow_core::nonce_line::counter_add_t(cursor, sz);
+                }
+                assert_eq!(segs, expected);
+            },
+        );
     }
 }

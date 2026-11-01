@@ -18,6 +18,7 @@ fn u512_to_u32s_le(v: U512) -> [u32; 16] {
 }
 
 struct Runner {
+    kernel: engine_gpu::Kernel,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -84,6 +85,7 @@ impl Runner {
         };
         use wgpu::BufferUsages as U;
         Runner {
+            kernel,
             pipeline,
             results: mk(132, U::STORAGE | U::COPY_SRC | U::COPY_DST),
             midstate: mk(96, U::STORAGE | U::UNIFORM | U::COPY_DST),
@@ -114,7 +116,7 @@ impl Runner {
         self.queue.write_buffer(
             &self.target,
             0,
-            bytemuck::cast_slice(&u512_to_u32s_le(target)),
+            bytemuck::cast_slice(&self.kernel.target_u32s_upload(target)),
         );
         self.queue
             .write_buffer(&self.cfg, 0, bytemuck::cast_slice(&[batch, 1u32, batch]));

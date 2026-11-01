@@ -350,6 +350,18 @@ impl WorkerPool {
     }
 }
 
+/// Nonces hashed per `search_range` call in serve mode.
+///
+/// Benchmark uses similar slice sizes so cancellation and new jobs are noticed
+/// between slices instead of only between large GPU engine batches inside one
+/// unbounded range (see quantus-miner issue #47).
+fn serve_search_slice_nonces(engine_type: EngineType) -> U512 {
+    match engine_type {
+        EngineType::Cpu => U512::from(10_000u64),
+        EngineType::Gpu => U512::from(1_000_000u64),
+    }
+}
+
 /// Log the end of a worker's search with hash rate info.
 fn log_worker_completion(
     type_str: &str,
@@ -388,16 +400,21 @@ fn worker_loop(
     log::info!("{type_str} worker {worker_id} started (persistent)");
 
     // Main job processing loop
+    let mut pending_job: Option<MiningJob> = None;
     loop {
         log::debug!("[WORKER {type_str}-{worker_id}] Waiting for job...");
 
-        // Wait for a job (blocking)
-        let mut job = match job_rx.recv() {
-            Ok(job) => job,
-            Err(_) => {
-                // Channel closed, pool is shutting down
-                log::debug!("{type_str} worker {worker_id} shutting down");
-                break;
+        // Wait for a job (blocking), or reuse one already drained during cancel
+        let mut job = if let Some(job) = pending_job.take() {
+            job
+        } else {
+            match job_rx.recv() {
+                Ok(job) => job,
+                Err(_) => {
+                    // Channel closed, pool is shutting down
+                    log::debug!("{type_str} worker {worker_id} shutting down");
+                    break;
+                }
             }
         };
 
@@ -412,23 +429,87 @@ fn worker_loop(
         }
 
         // Capture the job's ID for later validation
-        let job_id = job.job_id;
-        log::debug!("[WORKER {type_str}-{worker_id}] Received job {job_id}");
+        let search_job_id = job.job_id;
+        log::debug!("[WORKER {type_str}-{worker_id}] Received job {search_job_id}");
 
-        // Generate random starting nonce for this job
-        let start = generate_random_nonce();
-        let end = U512::MAX;
+        log::debug!("[WORKER {type_str}-{worker_id}] Starting search for job {search_job_id}");
 
-        log::debug!("[WORKER {type_str}-{worker_id}] Starting search for job {job_id}");
-
-        // Execute the search - both CPU and GPU use job ID comparison for cancellation
+        // Slice the search so job cancel and queued replacements are picked up
+        // between slices (matches benchmark harness chunking).
         let search_start = std::time::Instant::now();
-        let range = EngineRange { start, end };
-        let cancel_check = JobIdCancelCheck {
-            current_job_id: &current_job_id,
-            my_job_id: job_id,
+        let slice = serve_search_slice_nonces(engine_type);
+        let mut current = generate_random_nonce();
+        let mut accumulated_hashes = 0u64;
+        let mut result = engine_cpu::EngineStatus::Cancelled {
+            hash_count: 0,
         };
-        let result = engine.search_range(&job.ctx, range, &cancel_check);
+
+        'search: while current <= U512::MAX {
+            while let Ok(newer_job) = job_rx.try_recv() {
+                job = newer_job;
+            }
+            if job.job_id != search_job_id
+                || current_job_id.load(Ordering::SeqCst) != search_job_id
+            {
+                result = engine_cpu::EngineStatus::Cancelled {
+                    hash_count: accumulated_hashes,
+                };
+                break 'search;
+            }
+
+            let slice_end = current
+                .saturating_add(slice)
+                .saturating_sub(U512::one())
+                .min(U512::MAX);
+            let cancel_check = JobIdCancelCheck {
+                current_job_id: &current_job_id,
+                my_job_id: search_job_id,
+            };
+            let slice_result = engine.search_range(
+                &job.ctx,
+                EngineRange {
+                    start: current,
+                    end: slice_end,
+                },
+                &cancel_check,
+            );
+
+            match slice_result {
+                engine_cpu::EngineStatus::Found {
+                    candidate,
+                    hash_count,
+                    origin,
+                } => {
+                    accumulated_hashes += hash_count;
+                    result = engine_cpu::EngineStatus::Found {
+                        candidate,
+                        hash_count: accumulated_hashes,
+                        origin,
+                    };
+                    break 'search;
+                }
+                engine_cpu::EngineStatus::Cancelled { hash_count } => {
+                    accumulated_hashes += hash_count;
+                    result = engine_cpu::EngineStatus::Cancelled {
+                        hash_count: accumulated_hashes,
+                    };
+                    break 'search;
+                }
+                engine_cpu::EngineStatus::DeviceLost { hash_count } => {
+                    accumulated_hashes += hash_count;
+                    result = engine_cpu::EngineStatus::DeviceLost {
+                        hash_count: accumulated_hashes,
+                    };
+                    break 'search;
+                }
+                engine_cpu::EngineStatus::Exhausted { hash_count } => {
+                    accumulated_hashes += hash_count;
+                    current = slice_end.saturating_add(U512::one());
+                }
+                engine_cpu::EngineStatus::Running { .. } => break 'search,
+            }
+        }
+
         let search_elapsed = search_start.elapsed();
 
         let result_type = match &result {
@@ -439,14 +520,14 @@ fn worker_loop(
             engine_cpu::EngineStatus::Running { .. } => "RUNNING",
         };
         log::debug!(
-            "[WORKER {type_str}-{worker_id}] Job {job_id} search finished: {} in {:.2}s",
+            "[WORKER {type_str}-{worker_id}] Job {search_job_id} search finished: {} in {:.2}s",
             result_type,
             search_elapsed.as_secs_f64()
         );
 
         // Check if job ID changed during search - if so, this result is stale
         let actual_job_id = current_job_id.load(Ordering::SeqCst);
-        if actual_job_id != job_id {
+        if actual_job_id != search_job_id {
             // Still send hash count for metrics, but without the candidate
             let hash_count = match result {
                 engine_cpu::EngineStatus::Found { hash_count, .. } => hash_count,
@@ -466,11 +547,14 @@ fn worker_loop(
             let _ = result_tx.try_send(WorkerResult {
                 worker_id,
                 engine_type,
-                job_id,
+                job_id: search_job_id,
                 candidate: None, // Discard the stale candidate
                 hash_count,
                 completed: true,
             });
+            if job.job_id != search_job_id {
+                pending_job = Some(job);
+            }
             continue;
         }
 
@@ -482,7 +566,7 @@ fn worker_loop(
                 ..
             } => {
                 log::info!(
-                    "🎯 {type_str} worker {worker_id} found solution! Nonce: {}, Hash: {} (job {job_id})",
+                    "🎯 {type_str} worker {worker_id} found solution! Nonce: {}, Hash: {} (job {search_job_id})",
                     format_u512(nonce),
                     format_u512(hash),
                 );
@@ -517,7 +601,7 @@ fn worker_loop(
                 let _ = result_tx.try_send(WorkerResult {
                     worker_id,
                     engine_type,
-                    job_id,
+                    job_id: search_job_id,
                     candidate: None,
                     hash_count,
                     completed: true,
@@ -534,7 +618,7 @@ fn worker_loop(
         let _ = result_tx.try_send(WorkerResult {
             worker_id,
             engine_type,
-            job_id,
+            job_id: search_job_id,
             candidate,
             hash_count,
             completed: true,

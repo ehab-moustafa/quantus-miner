@@ -2,6 +2,10 @@
 //!
 //! This module provides a table-driven approach to GPU detection,
 //! using regex patterns with word boundaries to avoid substring matching issues.
+//!
+//! Runtime workgroup count on Metal may be overridden via `MAC_WORKGROUP_OVERRIDE`
+//! (see `get_vendor_specific_dispatch` in `lib.rs`); this module only supplies
+//! `workgroup_divisor` and `min_workgroups` per tier.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -465,7 +469,7 @@ const APPLE_TIERS: &[GpuTier] = &[
         pattern: r"m4 pro",
         name: "Apple M4 Pro",
         workgroup_divisor: 4,
-        min_workgroups: 400,
+        min_workgroups: 448,
     },
     GpuTier {
         pattern: r"\bm4\b",
@@ -653,6 +657,15 @@ pub fn detect_gpu_tier(vendor_name: &str, vendor_id: u32, is_metal_backend: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_m4_pro_dispatch_near_sixteen_k_workgroups() {
+        let tier = detect_gpu_tier("Apple M4 Pro", 0, true);
+        let max_workgroups = 65_535u32;
+        let optimal = (max_workgroups / tier.workgroup_divisor).max(tier.min_workgroups);
+        assert!(optimal >= 16_000);
+        assert!(optimal <= 16_384);
+    }
 
     #[test]
     fn test_nvidia_detection() {

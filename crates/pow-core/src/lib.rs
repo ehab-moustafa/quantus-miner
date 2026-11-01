@@ -2,6 +2,9 @@ use primitive_types::U512;
 use qp_poseidon_core::poseidon2::INITIAL_EXTERNAL_CONSTANTS;
 use qp_poseidon_core::{Goldilocks, Poseidon2};
 
+pub mod custom;
+pub mod nonce_line;
+
 pub use qp_poseidon_core::SPONGE_WIDTH;
 pub use qpow_math::{get_nonce_hash, is_valid_nonce, mine_range};
 
@@ -69,25 +72,8 @@ pub fn mining_prestate_low64(header: [u8; 32], nonce_be: [u8; 64]) -> [u64; SPON
     state.map(|felt| felt.as_canonical_u64())
 }
 
-fn external_linear_layer(state: &mut [Goldilocks; SPONGE_WIDTH]) {
-    for chunk in state.chunks_exact_mut(4) {
-        let chunk: &mut [Goldilocks; 4] = chunk.try_into().unwrap();
-        let t01 = chunk[0] + chunk[1];
-        let t23 = chunk[2] + chunk[3];
-        let t0123 = t01 + t23;
-        let t01123 = t0123 + chunk[1];
-        let t01233 = t0123 + chunk[3];
-        chunk[3] = t01233 + chunk[0] + chunk[0];
-        chunk[1] = t01123 + chunk[2] + chunk[2];
-        chunk[0] = t01123 + t01;
-        chunk[2] = t01233 + t23;
-    }
-
-    let sums: [Goldilocks; 4] =
-        std::array::from_fn(|offset| (offset..SPONGE_WIDTH).step_by(4).map(|i| state[i]).sum());
-    for (i, felt) in state.iter_mut().enumerate() {
-        *felt += sums[i % 4];
-    }
+pub(crate) fn external_linear_layer(state: &mut [Goldilocks; SPONGE_WIDTH]) {
+    custom::external_linear_layer(state);
 }
 
 /// Sponge state (canonical u64 felts) after absorbing the 32-byte header and the
@@ -96,16 +82,15 @@ fn external_linear_layer(state: &mut [Goldilocks; SPONGE_WIDTH]) {
 /// batch as long as incrementing the nonce never carries into its high 256 bits,
 /// so GPU kernels can resume the sponge from here and skip 2 of 5 permutations.
 pub fn mining_midstate(header: [u8; 32], nonce_high_be: [u8; 32]) -> [u64; SPONGE_WIDTH] {
-    let poseidon2 = Poseidon2::new();
     let mut state = [Goldilocks::ZERO; SPONGE_WIDTH];
     for (i, chunk) in header.chunks_exact(4).enumerate() {
         state[i] += Goldilocks::from_u64(u32::from_le_bytes(chunk.try_into().unwrap()) as u64);
     }
-    poseidon2.permute_mut(&mut state);
+    custom::permute_mut(&mut state);
     for (i, chunk) in nonce_high_be.chunks_exact(4).enumerate() {
         state[i] += Goldilocks::from_u64(u32::from_le_bytes(chunk.try_into().unwrap()) as u64);
     }
-    poseidon2.permute_mut(&mut state);
+    custom::permute_mut(&mut state);
     state.map(|g| g.as_canonical_u64())
 }
 
@@ -619,6 +604,42 @@ mod tests {
     fn u512_limb_roundtrip() {
         let n = (U512::from(0xdeadbeefcafeu64) << 300) | U512::from(0x1234567890abcdefu64);
         assert_eq!(u512_from_le_u32s(u512_to_le_u32s(n)), n);
+    }
+
+    #[test]
+    fn external_linear_layer_satisfies_m_times_delta() {
+        use qp_poseidon_core::Goldilocks;
+
+        fn ext(state: &[Goldilocks; SPONGE_WIDTH]) -> [Goldilocks; SPONGE_WIDTH] {
+            let mut s = *state;
+            external_linear_layer(&mut s);
+            s
+        }
+
+        let mut rng_state = 0x6a09e667f3bcc908u64;
+        let mut next_u64 = || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            rng_state
+        };
+
+        for _ in 0..32 {
+            let s: [Goldilocks; SPONGE_WIDTH] =
+                std::array::from_fn(|_| Goldilocks::from_u64(next_u64()));
+            let d: [Goldilocks; SPONGE_WIDTH] =
+                std::array::from_fn(|_| Goldilocks::from_u64(next_u64() & 0xffff));
+
+            let left = ext(&std::array::from_fn(|i| s[i] + d[i]));
+            let right: [Goldilocks; SPONGE_WIDTH] =
+                std::array::from_fn(|i| ext(&s)[i] + ext(&d)[i]);
+
+            assert_eq!(
+                left.map(|g| g.as_canonical_u64()),
+                right.map(|g| g.as_canonical_u64()),
+                "external_linear_layer must be F_p-linear"
+            );
+        }
     }
 
     #[test]

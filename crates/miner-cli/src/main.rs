@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 
 // CLI defaults
 const DEFAULT_GPU_BATCH_SIZE: u32 = 1_000_000;
+/// Default wgpu/Metal batch when neither `--gpu-batch-size` nor `MAC_DEFAULT_BATCH` is set.
+/// 8M is within noise of 4M on Apple Silicon and reduces batch-boundary overhead
+/// (see docs/thesis/phase-04/experiments/batch-size-metal).
+const DEFAULT_WGPU_BATCH_SIZE: u32 = 8_000_000;
 const DEFAULT_CUDA_BATCH_SIZE: u32 = 32_000_000;
 const DEFAULT_CPU_BATCH_SIZE: u64 = 10_000;
 
@@ -129,6 +133,14 @@ enum Command {
         #[arg(long = "cuda-gpu", env = "MINER_CUDA_GPU")]
         cuda_gpu: bool,
 
+        /// When CPU and GPU workers are both active, print separate CPU/GPU hash rates
+        /// in addition to the combined total (benchmark only).
+        #[arg(
+            long = "report-combined",
+            env = "MINER_BENCHMARK_REPORT_COMBINED"
+        )]
+        report_combined: bool,
+
         /// Enable verbose logging
         #[arg(short, long, env = "MINER_VERBOSE")]
         verbose: bool,
@@ -236,6 +248,7 @@ async fn main() {
             duration,
             allow_integrated,
             cuda_gpu,
+            report_combined,
             verbose,
         } => {
             init_logger(verbose);
@@ -247,18 +260,30 @@ async fn main() {
                 duration,
                 allow_integrated,
                 cuda_gpu,
+                report_combined,
             )
             .await;
         }
     }
 }
 
+fn resolve_wgpu_default_batch(mac_default_batch: Option<u32>) -> u32 {
+    mac_default_batch
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_WGPU_BATCH_SIZE)
+}
+
 fn resolve_gpu_batch_size(explicit: Option<u32>, cuda_gpu: bool) -> u32 {
-    explicit.unwrap_or(if cuda_gpu {
-        DEFAULT_CUDA_BATCH_SIZE
-    } else {
-        DEFAULT_GPU_BATCH_SIZE
-    })
+    if let Some(size) = explicit {
+        return size;
+    }
+    if cuda_gpu {
+        return DEFAULT_CUDA_BATCH_SIZE;
+    }
+    let mac_default = std::env::var("MAC_DEFAULT_BATCH")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok());
+    resolve_wgpu_default_batch(mac_default)
 }
 
 fn resolve_auth_token(
@@ -333,6 +358,7 @@ async fn run_benchmark(
     duration: u64,
     allow_integrated: bool,
     cuda_gpu: bool,
+    report_combined: bool,
 ) {
     let effective_cpu_workers = cpu_workers.unwrap_or_else(num_cpus::get);
 
@@ -406,6 +432,11 @@ async fn run_benchmark(
     // Spawn worker threads
     let mut handles = Vec::new();
     let total_hashes = Arc::new(std::sync::Mutex::new(0u64));
+    let hybrid_breakdown = report_combined
+        && effective_cpu_workers > 0
+        && effective_gpu_devices > 0;
+    let cpu_hashes = Arc::new(std::sync::Mutex::new(0u64));
+    let gpu_hashes = Arc::new(std::sync::Mutex::new(0u64));
 
     // Floor range widths at the old constants: engines still batch at the flag's
     // size internally, but tiny flags don't turn per-call harness overhead into
@@ -423,6 +454,17 @@ async fn run_benchmark(
         let ctx = ctx.clone();
         let cancel = cancel_flag.clone();
         let hashes = total_hashes.clone();
+        let is_cpu_worker = worker_id < effective_cpu_workers;
+        let cpu_hashes_worker = if hybrid_breakdown && is_cpu_worker {
+            Some(cpu_hashes.clone())
+        } else {
+            None
+        };
+        let gpu_hashes_worker = if hybrid_breakdown && !is_cpu_worker {
+            Some(gpu_hashes.clone())
+        } else {
+            None
+        };
         let start = benchmark_start;
 
         let handle = thread::spawn(move || {
@@ -451,6 +493,12 @@ async fn run_benchmark(
                     | engine_cpu::EngineStatus::Cancelled { hash_count }
                     | engine_cpu::EngineStatus::DeviceLost { hash_count } => {
                         *hashes.lock().unwrap() += hash_count;
+                        if let Some(cpu) = &cpu_hashes_worker {
+                            *cpu.lock().unwrap() += hash_count;
+                        }
+                        if let Some(gpu) = &gpu_hashes_worker {
+                            *gpu.lock().unwrap() += hash_count;
+                        }
                     }
                     engine_cpu::EngineStatus::Running { .. } => {}
                 }
@@ -511,12 +559,58 @@ async fn run_benchmark(
     println!("Total hashes: {}", final_hashes);
     println!("Average rate: {} H/s", format_hash_rate(avg_rate));
 
-    if total_workers > 1 {
+    if hybrid_breakdown {
+        let cpu_total = *cpu_hashes.lock().unwrap();
+        let gpu_total = *gpu_hashes.lock().unwrap();
+        let elapsed = total_elapsed.as_secs_f64();
+        let cpu_rate = cpu_total as f64 / elapsed;
+        let gpu_rate = gpu_total as f64 / elapsed;
+        let combined_rate = cpu_rate + gpu_rate;
+        println!();
+        println!("Hybrid breakdown (--report-combined):");
+        println!(
+            "  CPU ({} workers): {} H/s",
+            effective_cpu_workers,
+            format_hash_rate(cpu_rate)
+        );
+        println!(
+            "  GPU ({} devices): {} H/s",
+            effective_gpu_devices,
+            format_hash_rate(gpu_rate)
+        );
+        println!("  Combined (CPU+GPU): {} H/s", format_hash_rate(combined_rate));
+    } else if total_workers > 1 {
         let per_worker = avg_rate / total_workers as f64;
         println!("Per-worker: {} H/s", format_hash_rate(per_worker));
     }
 
     println!("✅ Benchmark completed!");
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn wgpu_default_batch_is_eight_million() {
+        assert_eq!(DEFAULT_WGPU_BATCH_SIZE, 8_000_000);
+        assert_eq!(resolve_wgpu_default_batch(None), 8_000_000);
+    }
+
+    #[test]
+    fn mac_default_batch_overrides_wgpu_default() {
+        assert_eq!(resolve_wgpu_default_batch(Some(4_000_000)), 4_000_000);
+    }
+
+    #[test]
+    fn explicit_gpu_batch_beats_defaults() {
+        assert_eq!(resolve_gpu_batch_size(Some(2_000_000), false), 2_000_000);
+    }
+
+    #[test]
+    fn cuda_default_unchanged() {
+        assert_eq!(resolve_gpu_batch_size(None, true), DEFAULT_CUDA_BATCH_SIZE);
+    }
 }
 
 fn format_hash_rate(rate: f64) -> String {
