@@ -1823,10 +1823,10 @@ mod tests {
 
     #[test]
     fn cuda_mining_main_search_multisegment_exhausted_matches_pow_core_count() {
+        with_isolated_cuda_env(&[("MINER_CUDA_K_SEGMENT", "1000")], || {
         let Some(engine) = engine_or_skip_with(3000) else {
             return;
         };
-        with_isolated_cuda_env(&[("MINER_CUDA_K_SEGMENT", "1000")], || {
         let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
         let ctx = JobContext {
             header,
@@ -2464,10 +2464,7 @@ mod tests {
         let _guard = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
-        if !keys.iter().any(|k| *k == "REQUIRE_CUDA") {
-            keys.push("REQUIRE_CUDA");
-        }
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
         let saved: Vec<(String, Option<String>)> = keys
             .iter()
             .map(|k| ((*k).to_string(), std::env::var(k).ok()))
@@ -2711,6 +2708,7 @@ mod tests {
     #[test]
     fn cuda_cpp_out0_matches_pow_core_high_half_and_dispatch() {
         const CONFIGS: &[(&str, bool)] = &[("legacy_perm", false), ("cpp_out0", true)];
+        let strict_cuda = require_cuda_env();
         let cmp_limbs = cuda_cmp_limbs() as usize;
         let mut legacy_exhaust: Option<u64> = None;
         let mut legacy_probes: Option<Vec<([u32; 8], u32, U512)>> = None;
@@ -2720,7 +2718,7 @@ mod tests {
             with_nvrtc_env(&env, || {
                 CudaEngine::clear_worker_resources();
                 let Some(engine) = engine_or_skip_with(8192) else {
-                    if require_cuda_env() {
+                    if strict_cuda {
                         panic!("REQUIRE_CUDA=1: CUDA device required for {label}");
                     }
                     eprintln!("skipping cuda_cpp_out0 ({label}): no CUDA device");
