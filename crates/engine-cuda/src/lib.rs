@@ -228,7 +228,7 @@ fn nvrtc_compile_tag() -> u32 {
     if cuda_fused_diag_enabled() {
         tag |= 1 << 22;
     }
-    if cuda_pipe_sbox_enabled() {
+    if cuda_pipe_sbox_enabled() || cuda_nonce_line_pipe_enabled() {
         tag |= 1 << 23;
     }
     tag |= (cuda_internal_unroll() & 7) << 24;
