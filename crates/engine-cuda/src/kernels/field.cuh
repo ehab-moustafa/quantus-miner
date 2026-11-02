@@ -5,6 +5,9 @@ typedef unsigned long long u64;
 const u64 P64 = 0xFFFFFFFF00000001ULL;
 const u64 EPS64 = 0xFFFFFFFFULL;
 const u32 EPS32 = 0xFFFFFFFFu;
+// u <- u + (p - 35), v <- v + 35 on the nonce line (exact gf64_add, not lazy).
+const u64 P64_MINUS_35 = 0xFFFFFFFEFFFFFFDCULL;
+const u64 GF64_35 = 35ULL;
 
 // Sum in [0, 2^64) with a single 2^64 -> EPS fold. The fold itself can only
 // wrap when both inputs are within 2^32 of 2^64, which reducer outputs never are
@@ -59,8 +62,8 @@ __device__ __forceinline__ void gf64_nonce_line_uv_at(u64 pk0, u64 pk1, u32 t, u
 }
 
 __device__ __forceinline__ void gf64_nonce_line_uv_step(u64 &u, u64 &v) {
-    u = gf64_add(u, P64 - 35ULL);
-    v = gf64_add(v, 35ULL);
+    u = gf64_add(u, P64_MINUS_35);
+    v = gf64_add(v, GF64_35);
 }
 
 __device__ __forceinline__ void mul64wide(u64 a, u64 b, u32 &r0, u32 &r1,
@@ -97,6 +100,31 @@ __device__ __forceinline__ u64 reduce128(u32 r0, u32 r1, u32 r2, u32 r3) {
     return ((u64)o1 << 32) | (u64)o0;
 }
 
+// CPPminer CP_QPOW_WRED_FAST-style fold: omit the high-lane carry bump after EPS
+// madc (filter path only; host CPU re-verifies hits). NVRTC: MINER_CUDA_OUT0_LAZY_W=1.
+__device__ __forceinline__ u64 reduce128_wred_fast(u32 r0, u32 r1, u32 r2, u32 r3) {
+    u32 o0, o1;
+    asm("{\n\t"
+        ".reg .u32 c;\n\t"
+        "mad.lo.cc.u32 %0, %4, %6, %2;\n\t"
+        "madc.hi.cc.u32 %1, %4, %6, %3;\n\t"
+        "addc.u32 c, %5, 0;\n\t"
+        "sub.cc.u32 %0, %0, c;\n\t"
+        "subc.u32 %1, %1, 0;\n\t"
+        "}"
+        : "=&r"(o0), "=&r"(o1)
+        : "r"(r0), "r"(r1), "r"(r2), "r"(r3), "r"(EPS32));
+    return ((u64)o1 << 32) | (u64)o0;
+}
+
+#if defined(MINER_CUDA_OUT0_LAZY_W) && MINER_CUDA_OUT0_LAZY_W
+#define CPP_OUT0_REDUCE128 reduce128_wred_fast
+#define CPP_OUT0_GF64_ADD gf64_add_lazy
+#else
+#define CPP_OUT0_REDUCE128 reduce128
+#define CPP_OUT0_GF64_ADD gf64_add
+#endif
+
 __device__ __forceinline__ u64 gf64_mul(u64 a, u64 b) {
     u32 r0, r1, r2, r3;
     mul64wide(a, b, r0, r1, r2, r3);
@@ -129,6 +157,18 @@ __device__ __forceinline__ u64 gf64_sbox(u64 x) {
     u64 x3 = gf64_mul(x2, x);
     u64 x4 = gf64_sqr(x2);
     return gf64_mul(x4, x3);
+}
+
+// Round-1 f=S(u), g=S(v): interleave squares/muls so u and v chains overlap (NCU).
+__device__ __forceinline__ void gf64_sbox_pair(u64 u, u64 v, u64 &fu, u64 &gv) {
+    u64 u2 = gf64_sqr(u);
+    u64 v2 = gf64_sqr(v);
+    u64 u3 = gf64_mul(u2, u);
+    u64 v3 = gf64_mul(v2, v);
+    u64 u4 = gf64_sqr(u2);
+    u64 v4 = gf64_sqr(v2);
+    fu = gf64_mul(u4, u3);
+    gv = gf64_mul(v4, v3);
 }
 
 __device__ __forceinline__ u64 gf64_canon(u64 a) {

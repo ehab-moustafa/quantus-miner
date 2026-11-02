@@ -129,6 +129,23 @@ __device__ __forceinline__ void ext_layer64_chunk4_wide(Wide x0, Wide x1, Wide x
     wide_add_wide(y2, t23);
 }
 
+__device__ __forceinline__ void ext_layer64_col_sum_twopass(const u64 *state, Wide col_sum[4]) {
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+        col_sum[k] = wide_from(0ULL);
+    }
+    #pragma unroll
+    for (int chunk = 0; chunk < 3; chunk++) {
+        int o = chunk * 4;
+        Wide y0, y1, y2, y3;
+        ext_layer64_chunk4(state[o], state[o + 1], state[o + 2], state[o + 3], y0, y1, y2, y3);
+        wide_add_wide(col_sum[0], y0);
+        wide_add_wide(col_sum[1], y1);
+        wide_add_wide(col_sum[2], y2);
+        wide_add_wide(col_sum[3], y3);
+    }
+}
+
 __device__ __forceinline__ void ext_layer64_col_sum(const u64 *state, Wide col_sum[4]) {
     Wide s0 = wide_from(state[0]);
     wide_add(s0, state[4]);
@@ -145,12 +162,20 @@ __device__ __forceinline__ void ext_layer64_col_sum(const u64 *state, Wide col_s
     ext_layer64_chunk4_wide(s0, s1, s2, s3, col_sum[0], col_sum[1], col_sum[2], col_sum[3]);
 }
 
+__device__ __forceinline__ void ext_layer64_cols(const u64 *state, Wide col_sum[4]) {
+#ifdef MINER_CUDA_EXT_ONE_M4
+    ext_layer64_col_sum(state, col_sum);
+#else
+    ext_layer64_col_sum_twopass(state, col_sum);
+#endif
+}
+
 #ifdef MINER_CUDA_EXT_V2
 // Experimental: pass-2 fully unrolled (no chunk loop) so ptxas can overlap
 // reduce128 chains across the twelve lanes; enable with MINER_CUDA_EXT_V2=1.
 __device__ __forceinline__ void ext_layer64(u64 *state, const u64 *rc12) {
     Wide col_sum[4];
-    ext_layer64_col_sum(state, col_sum);
+    ext_layer64_cols(state, col_sum);
     ext_layer64_reduce_chunk4(state[0], state[1], state[2], state[3], col_sum,
                               rc12[0], rc12[1], rc12[2], rc12[3], &state[0],
                               &state[1], &state[2], &state[3]);
@@ -164,7 +189,7 @@ __device__ __forceinline__ void ext_layer64(u64 *state, const u64 *rc12) {
 #else
 __device__ __forceinline__ void ext_layer64(u64 *state, const u64 *rc12) {
     Wide col_sum[4];
-    ext_layer64_col_sum(state, col_sum);
+    ext_layer64_cols(state, col_sum);
     #pragma unroll
     for (int chunk = 0; chunk < 3; chunk++) {
         int o = chunk * 4;
@@ -178,31 +203,63 @@ __device__ __forceinline__ void ext_layer64(u64 *state, const u64 *rc12) {
 }
 #endif
 
-// Software-pipelined internal round. `x` is this round's S-boxed element 0.
-// Elements 1..11 are summed before x is needed, element 0's output comes out
-// first so the caller can start the next S-box while the other 11 products
-// retire, and the unreduced 96-bit row sum (plus rc0 for element 0) rides in
-// the multiply accumulators. Returns the new element 0; updates state[1..11].
-__device__ __forceinline__ u64 int_round_p(u64 *state, u64 x, u64 rc0) {
+// Same product either way: fused form folds the row sum into mad.wide.
+__device__ __forceinline__ void mul_diag_add(u64 a, u64 diag, const Wide &w,
+                                             u32 &r0, u32 &r1, u32 &r2, u32 &r3) {
+#if defined(MINER_CUDA_FUSED_DIAG)
+    mul128_add_wide(a, diag, w, r0, r1, r2, r3);
+#else
+    mul64wide(a, diag, r0, r1, r2, r3);
+    add128_wide(r0, r1, r2, r3, w);
+#endif
+}
+
+__device__ __forceinline__ Wide int_row_sum(const u64 *state, u64 x) {
     Wide s = wide_from(state[1]);
     #pragma unroll
     for (int i = 2; i < 12; i++) {
         wide_add(s, state[i]);
     }
     wide_add(s, x);
-    Wide s0 = s;
+    return s;
+}
+
+// Element 0 only. state[1..11] stay intact so the tail (or a pipelined S-box)
+// can still read them.
+__device__ __forceinline__ u64 int_round_head(u64 *state, u64 x, u64 rc0) {
+    Wide s0 = int_row_sum(state, x);
     wide_add(s0, rc0);
     u32 r0, r1, r2, r3;
-    mul64wide(x, MDS_DIAG[0], r0, r1, r2, r3);
-    add128_wide(r0, r1, r2, r3, s0);
-    u64 out0 = reduce128(r0, r1, r2, r3);
+    mul_diag_add(x, MDS_DIAG[0], s0, r0, r1, r2, r3);
+    return reduce128(r0, r1, r2, r3);
+}
+
+__device__ __forceinline__ void int_round_tail(u64 *state, u64 x) {
+    Wide s = int_row_sum(state, x);
     #pragma unroll
     for (int i = 1; i < 12; i++) {
-        mul64wide(state[i], MDS_DIAG[i], r0, r1, r2, r3);
-        add128_wide(r0, r1, r2, r3, s);
+        u32 r0, r1, r2, r3;
+        mul_diag_add(state[i], MDS_DIAG[i], s, r0, r1, r2, r3);
         state[i] = reduce128(r0, r1, r2, r3);
     }
+}
+
+// Software-pipelined internal round. `x` is this round's S-boxed element 0.
+// Elements 1..11 are summed before x is needed, element 0's output comes out
+// first so the caller can start the next S-box while the other 11 products
+// retire, and the unreduced 96-bit row sum (plus rc0 for element 0) rides in
+// the multiply accumulators. Returns the new element 0; updates state[1..11].
+__device__ __forceinline__ u64 int_round_p(u64 *state, u64 x, u64 rc0) {
+    u64 out0 = int_round_head(state, x, rc0);
+    int_round_tail(state, x);
     return out0;
+}
+
+// x^7 split so the square can issue before the 11 diagonal products.
+__device__ __forceinline__ u64 gf64_sbox_after_sqr(u64 x, u64 x2) {
+    u64 x4 = gf64_sqr(x2);
+    u64 x3 = gf64_mul(x2, x);
+    return gf64_mul(x4, x3);
 }
 
 __device__ __forceinline__ void permute64_after_initial(u64 *state) {
@@ -215,10 +272,24 @@ __device__ __forceinline__ void permute64_after_initial(u64 *state) {
         ext_layer64(state, RC_INITIAL[r + 1]);
     }
     u64 x = gf64_sbox(state[0]);
-    #pragma unroll 1
+#ifndef MINER_CUDA_INTERNAL_UNROLL
+#define MINER_CUDA_INTERNAL_UNROLL 1
+#endif
+#if (defined(MINER_CUDA_PIPE_SBOX) && MINER_CUDA_PIPE_SBOX) || \
+    (defined(MINER_CUDA_NONCE_LINE_PIPE) && MINER_CUDA_NONCE_LINE_PIPE)
+    #pragma unroll MINER_CUDA_INTERNAL_UNROLL
+    for (int r = 0; r < 21; r++) {
+        u64 out0 = int_round_head(state, x, RC_INTERNAL[r + 1]);
+        u64 x2 = gf64_sqr(out0);
+        int_round_tail(state, x);
+        x = gf64_sbox_after_sqr(out0, x2);
+    }
+#else
+    #pragma unroll MINER_CUDA_INTERNAL_UNROLL
     for (int r = 0; r < 21; r++) {
         x = gf64_sbox(int_round_p(state, x, RC_INTERNAL[r + 1]));
     }
+#endif
     state[0] = int_round_p(state, x, 0ULL);
     #pragma unroll
     for (int i = 0; i < 12; i++) {

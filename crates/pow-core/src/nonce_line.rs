@@ -16,6 +16,31 @@ pub const K_PARAMS: usize = 14;
 
 pub const V: [i32; 8] = [4, -17, 11, -3, -4, 17, -11, 3];
 
+const P64: u64 = 0xffff_ffff_0000_0001;
+const EPS: u64 = 0xffff_ffff;
+
+/// Bit-exact `gf64_add` from CUDA `field.cuh` (not lazy carry).
+#[inline]
+pub fn gf64_add_u64(a: u64, b: u64) -> u64 {
+    let (sum, carry) = a.overflowing_add(b);
+    if !carry {
+        sum
+    } else {
+        sum.wrapping_add(EPS)
+    }
+}
+
+/// Pre-S-box nonce-line inputs: `u(t) = pk0 + (p - 35*t)`, `v(t) = pk1 + 35*t`.
+/// Must match `gf64_nonce_line_uv_at` in `field.cuh` (device probe + kernel stepping).
+#[inline]
+pub fn uv_at(pk0: u64, pk1: u64, t: u32) -> (u64, u64) {
+    let d = 35u64.wrapping_mul(u64::from(t));
+    (
+        gf64_add_u64(pk0, P64.wrapping_sub(d)),
+        gf64_add_u64(pk1, d),
+    )
+}
+
 /// Bits `[pos, pos + len)` of the 256-bit big-endian number in `b[0..32]`.
 pub fn bits256_be(b: &[u8; 32], pos: usize, len: usize) -> u32 {
     let mut r = 0u32;

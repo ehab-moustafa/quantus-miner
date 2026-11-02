@@ -165,6 +165,33 @@ pub fn miner_cuda_nonce_line_kernel_ready() -> bool {
     true
 }
 
+/// Experimental CPPminer partial digest path (`-DMINER_CUDA_CPP_OUT0` at NVRTC).
+/// See `kernels/cpp_out0.cuh` — not linked into `mining_main` yet.
+fn cuda_cpp_out0_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_CPP_OUT0")
+}
+
+/// Lazy wide reduce + terminal adds inside `cpp_out0_internal22` (filter path).
+fn cuda_out0_lazy_w_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_OUT0_LAZY_W")
+}
+
+fn cuda_out0_g_unroll_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_OUT0_G_UNROLL")
+}
+
+fn cuda_out0_g_partial9_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_OUT0_G_PARTIAL9")
+}
+
+fn cuda_out0_ext_unroll_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_OUT0_EXT_UNROLL")
+}
+
+fn cuda_out0_g_partial_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_OUT0_G_PARTIAL")
+}
+
 /// Experimental `ext_layer64` pass-2 scheduling (`-DMINER_CUDA_EXT_V2` at NVRTC).
 fn cuda_ext_v2_enabled() -> bool {
     std::env::var("MINER_CUDA_EXT_V2")
@@ -193,7 +220,161 @@ fn nvrtc_compile_tag() -> u32 {
     if cuda_ext_v2_enabled() {
         tag |= 4;
     }
+    if cuda_ext_one_m4_enabled() {
+        tag |= 8;
+    }
+    tag |= (cuda_min_blocks() & 15) << 8;
+    tag |= (cuda_launch_threads() & 1023) << 12;
+    if cuda_fused_diag_enabled() {
+        tag |= 1 << 22;
+    }
+    if cuda_pipe_sbox_enabled() {
+        tag |= 1 << 23;
+    }
+    tag |= (cuda_internal_unroll() & 7) << 24;
+    tag |= (cuda_cmp_limbs() & 15) << 28;
+    if cuda_dual_enabled() {
+        tag |= 1 << 27;
+    }
+    if cuda_cpp_out0_enabled() {
+        tag |= 1 << 21;
+    }
+    if cuda_out0_lazy_w_enabled() {
+        tag |= 1 << 20;
+    }
+    if cuda_out0_g_unroll_enabled() {
+        tag |= 1 << 19;
+    }
+    if cuda_out0_g_partial9_enabled() {
+        tag |= 1 << 17;
+    } else if cuda_out0_g_partial_enabled() {
+        tag |= 1 << 18;
+    }
+    if cuda_out0_ext_unroll_enabled() {
+        tag |= 1 << 16;
+    }
+    if cuda_nonce_line_sh_pk_enabled() {
+        tag |= 1 << 15;
+    }
+    if cuda_nonce_line_pipe_enabled() {
+        tag |= 1 << 14;
+    }
+    tag |= cuda_nonce_line_ext_sbox_unroll() << 29;
+    tag |= cuda_nonce_line_term_ext_unroll() << 30;
+    tag |= (cuda_nonce_line_t_unroll() & 31) << 25;
+    tag |= (cuda_nonce_line_min_blocks() & 15) << 10;
+    tag |= (cuda_nonce_line_launch_threads() & 1023) << 20;
     tag
+}
+
+fn cuda_flag_on(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn cuda_fused_diag_enabled() -> bool {
+    match std::env::var("MINER_CUDA_FUSED_DIAG").as_deref() {
+        Ok("0") | Ok("false") | Ok("FALSE") => false,
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("") => true,
+        Ok(other) => {
+            log::warn!(
+                target: "cuda_engine",
+                "MINER_CUDA_FUSED_DIAG={other} invalid; use 0 or 1 (default on)"
+            );
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+fn cuda_pipe_sbox_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_PIPE_SBOX")
+}
+
+fn cuda_dual_enabled() -> bool {
+    cuda_flag_on("MINER_CUDA_DUAL")
+}
+
+fn cuda_internal_unroll() -> u32 {
+    env_u32("MINER_CUDA_INTERNAL_UNROLL", 1).clamp(1, 4)
+}
+
+fn cuda_cmp_limbs() -> u32 {
+    env_u32("MINER_CUDA_CMP_LIMBS", 8).clamp(1, 8)
+}
+
+fn cuda_ext_one_m4_enabled() -> bool {
+    std::env::var("MINER_CUDA_EXT_ONE_M4")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn cuda_min_blocks() -> u32 {
+    env_u32("MINER_CUDA_MIN_BLOCKS", 4).clamp(1, 8)
+}
+
+fn cuda_launch_threads() -> u32 {
+    env_u32("MINER_CUDA_BLOCK_DIM", DEFAULT_THREADS_PER_BLOCK).clamp(32, 1024)
+}
+
+/// NCU: nonce-line kernel is register-heavy (~126); separate launch_bounds from flat mining.
+fn cuda_nonce_line_min_blocks() -> u32 {
+    env_u32("MINER_CUDA_NONCE_LINE_MIN_BLOCKS", 2).clamp(1, 8)
+}
+
+fn cuda_nonce_line_launch_threads() -> u32 {
+    env_u32("MINER_CUDA_NONCE_LINE_BLOCK_DIM", cuda_launch_threads()).clamp(32, 1024)
+}
+
+fn cuda_nonce_line_sh_pk_enabled() -> bool {
+    match std::env::var("MINER_CUDA_NONCE_LINE_SH_PK").as_deref() {
+        Ok("0") | Ok("false") | Ok("FALSE") => false,
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("") => true,
+        Ok(other) => {
+            log::warn!(
+                target: "cuda_engine",
+                "MINER_CUDA_NONCE_LINE_SH_PK={other} invalid; use 0 or 1 (default on)"
+            );
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+/// Software-pipelined internal rounds in nonce_line_permute (default on; NCU stall overlap).
+fn cuda_nonce_line_ext_sbox_unroll() -> u32 {
+    env_u32("MINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL", 0).min(1)
+}
+
+fn cuda_nonce_line_term_ext_unroll() -> u32 {
+    env_u32("MINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL", 0).min(1)
+}
+
+fn cuda_nonce_line_t_unroll() -> u32 {
+    env_u32("MINER_CUDA_NONCE_LINE_T_UNROLL", 1).clamp(1, 32)
+}
+
+fn cuda_nonce_line_pipe_enabled() -> bool {
+    match std::env::var("MINER_CUDA_NONCE_LINE_PIPE").as_deref() {
+        Ok("0") | Ok("false") | Ok("FALSE") => false,
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("") => true,
+        Ok(other) => {
+            log::warn!(
+                target: "cuda_engine",
+                "MINER_CUDA_NONCE_LINE_PIPE={other} invalid; use 0 or 1 (default on)"
+            );
+            true
+        }
+        Err(_) => true,
+    }
+}
+
+fn cuda_nonce_line_launch_config() -> (u32, u32) {
+    (
+        cuda_nonce_line_launch_threads(),
+        env_u32("MINER_CUDA_MAX_BLOCKS", DEFAULT_MAX_BLOCKS),
+    )
 }
 
 /// Metadata passed when building per-segment [`MiningParams`].
@@ -302,7 +483,11 @@ fn plan_k_segments(batch_start: U512, batch_size: u32) -> Vec<(U512, u32)> {
 }
 
 fn mining_dispatch(segment_size: u32, seg: &KSegmentContext) -> ([u32; 3], u32, u32) {
-    let (threads_per_block, max_blocks) = cuda_launch_config();
+    let (threads_per_block, max_blocks) = if cuda_use_nonce_line() {
+        cuda_nonce_line_launch_config()
+    } else {
+        cuda_launch_config()
+    };
     let num_blocks = segment_size
         .div_ceil(threads_per_block)
         .clamp(1, max_blocks);
@@ -533,6 +718,26 @@ fn nvrtc_version() -> Result<(i32, i32), String> {
     Ok((major, minor))
 }
 
+/// Newest NVRTC virtual arch the installed toolkit supports that the device can run.
+fn nvrtc_ptx_target_arch(device_arch: i32) -> Result<i32, String> {
+    if let Ok(raw) = std::env::var("MINER_CUDA_PTX_ARCH") {
+        return raw
+            .parse()
+            .map_err(|_| "MINER_CUDA_PTX_ARCH must be an integer (e.g. 120)".into());
+    }
+    let supported = nvrtc_supported_archs()?;
+    supported
+        .iter()
+        .copied()
+        .filter(|&arch| arch <= device_arch)
+        .max()
+        .ok_or_else(|| {
+            format!(
+                "NVRTC supports no architecture at or below sm_{device_arch}; supported={supported:?}"
+            )
+        })
+}
+
 /// Compiles PTX for the newest virtual architecture NVRTC knows that the device
 /// can run. The driver JIT then emits native code; on a 4090 that measured
 /// equal to loading NVRTC's own cubin, so the PTX route is kept.
@@ -547,26 +752,13 @@ fn compile_kernel(major: i32, minor: i32) -> Result<Ptx, Box<dyn std::error::Err
         nv_minor,
         supported
     );
-    let target = if let Ok(raw) = std::env::var("MINER_CUDA_PTX_ARCH") {
-        let forced: i32 = raw
-            .parse()
-            .map_err(|_| "MINER_CUDA_PTX_ARCH must be an integer (e.g. 120)")?;
+    let target = nvrtc_ptx_target_arch(device_arch)?;
+    if std::env::var("MINER_CUDA_PTX_ARCH").is_ok() {
         log::warn!(
             target: "cuda_engine",
-            "MINER_CUDA_PTX_ARCH={forced} overrides NVRTC arch selection for sm_{device_arch}"
+            "MINER_CUDA_PTX_ARCH overrides NVRTC arch selection for sm_{device_arch} (using compute_{target})"
         );
-        forced
-    } else {
-        supported
-            .iter()
-            .copied()
-            .filter(|&arch| arch <= device_arch)
-            .max()
-            .ok_or_else(|| {
-                format!("NVRTC supports no architecture at or below sm_{device_arch}; supported={supported:?}")
-            })?
-    };
-    if target != device_arch {
+    } else if target != device_arch {
         log::warn!(
             target: "cuda_engine",
             "NVRTC does not know sm_{device_arch}; compiling PTX for compute_{target} instead (install CUDA 12.8+ libnvrtc on the host)"
@@ -587,6 +779,30 @@ fn compile_kernel(major: i32, minor: i32) -> Result<Ptx, Box<dyn std::error::Err
         log::info!(
             target: "cuda_engine",
             "MINER_CUDA_LAZY_CARRY=1: gf64_add_lazy on nonce/t absorb (#110 item 3)"
+        );
+    }
+    if cuda_cpp_out0_enabled() {
+        log::info!(
+            target: "cuda_engine",
+            "MINER_CUDA_CPP_OUT0=1: nonce-line uses CPPminer out0 second-permute schedule (host re-verify on hits)"
+        );
+    }
+    if cuda_out0_lazy_w_enabled() {
+        log::info!(
+            target: "cuda_engine",
+            "MINER_CUDA_OUT0_LAZY_W=1: reduce128_wred_fast + lazy terminal adds in cpp_out0_internal22"
+        );
+    }
+    if cuda_out0_g_unroll_enabled() {
+        log::info!(
+            target: "cuda_engine",
+            "MINER_CUDA_OUT0_G_UNROLL=1: fully unrolled hash_out0 g=1..15 loop"
+        );
+    }
+    if cuda_out0_g_partial_enabled() {
+        log::info!(
+            target: "cuda_engine",
+            "MINER_CUDA_OUT0_G_PARTIAL=1: unrolled hash_out0 g=1..7, loop g=8..15"
         );
     }
     let opts = nvrtc_compile_options(target);
@@ -628,13 +844,76 @@ fn nvrtc_compile_options(gpu_arch: i32) -> CompileOptions {
         format!("--gpu-architecture=compute_{gpu_arch}"),
         format!("-I{kernel_dir}"),
         format!("-DMINER_CUDA_GF64_32BIT={gf64_32bit}"),
+        format!("-DMINER_CUDA_MIN_BLOCKS={}", cuda_min_blocks()),
+        format!("-DMINER_CUDA_LAUNCH_THREADS={}", cuda_launch_threads()),
+        format!(
+            "-DMINER_CUDA_NONCE_LINE_MIN_BLOCKS={}",
+            cuda_nonce_line_min_blocks()
+        ),
+        format!(
+            "-DMINER_CUDA_NONCE_LINE_LAUNCH_THREADS={}",
+            cuda_nonce_line_launch_threads()
+        ),
+        format!("-DMINER_CUDA_INTERNAL_UNROLL={}", cuda_internal_unroll()),
+        format!("-DMINER_CUDA_CMP_LIMBS={}", cuda_cmp_limbs()),
     ];
+    if cuda_fused_diag_enabled() {
+        options.push("-DMINER_CUDA_FUSED_DIAG".into());
+    }
+    if cuda_pipe_sbox_enabled() || cuda_nonce_line_pipe_enabled() {
+        options.push("-DMINER_CUDA_PIPE_SBOX".into());
+    }
+    if cuda_dual_enabled() {
+        options.push("-DMINER_CUDA_DUAL".into());
+    }
     if cuda_ext_v2_enabled() {
         options.push("-DMINER_CUDA_EXT_V2".into());
+    }
+    if cuda_ext_one_m4_enabled() {
+        options.push("-DMINER_CUDA_EXT_ONE_M4".into());
     }
     if cuda_lazy_carry_enabled() {
         options.push("-DMINER_CUDA_LAZY_CARRY=1".into());
     }
+    if cuda_cpp_out0_enabled() {
+        options.push("-DMINER_CUDA_CPP_OUT0=1".into());
+    }
+    if cuda_out0_lazy_w_enabled() {
+        options.push("-DMINER_CUDA_OUT0_LAZY_W=1".into());
+    }
+    if cuda_out0_g_unroll_enabled() {
+        options.push("-DMINER_CUDA_OUT0_G_UNROLL=1".into());
+    }
+    if cuda_out0_ext_unroll_enabled() {
+        options.push("-DMINER_CUDA_OUT0_EXT_UNROLL=1".into());
+    }
+    if cuda_out0_g_partial9_enabled() {
+        options.push("-DMINER_CUDA_OUT0_G_PARTIAL9=1".into());
+    } else if cuda_out0_g_partial_enabled() {
+        options.push("-DMINER_CUDA_OUT0_G_PARTIAL=1".into());
+    }
+    if cuda_nonce_line_sh_pk_enabled() {
+        options.push("-DMINER_CUDA_NONCE_LINE_SH_PK=1".into());
+    } else {
+        options.push("-DMINER_CUDA_NONCE_LINE_SH_PK=0".into());
+    }
+    if cuda_nonce_line_pipe_enabled() {
+        options.push("-DMINER_CUDA_NONCE_LINE_PIPE=1".into());
+    } else {
+        options.push("-DMINER_CUDA_NONCE_LINE_PIPE=0".into());
+    }
+    options.push(format!(
+        "-DMINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL={}",
+        cuda_nonce_line_ext_sbox_unroll()
+    ));
+    options.push(format!(
+        "-DMINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL={}",
+        cuda_nonce_line_term_ext_unroll()
+    ));
+    options.push(format!(
+        "-DMINER_CUDA_NONCE_LINE_T_UNROLL={}",
+        cuda_nonce_line_t_unroll()
+    ));
     CompileOptions {
         options,
         ..Default::default()
@@ -1368,13 +1647,20 @@ mod tests {
         let _guard = ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let keys = ["MINER_CUDA_NONCE_LINE", "MINER_CUDA_K_SEGMENT"];
-        let saved: Vec<(String, Option<String>)> = keys
+        const KEYS: &[&str] = &[
+            "REQUIRE_CUDA",
+            "MINER_CUDA_NONCE_LINE",
+            "MINER_CUDA_K_SEGMENT",
+            "MINER_CUDA_CPP_OUT0",
+            "MINER_CUDA_NONCE_LINE_PIPE",
+            "MINER_CUDA_PIPE_SBOX",
+        ];
+        let saved: Vec<(String, Option<String>)> = KEYS
             .iter()
             .map(|k| ((*k).to_string(), std::env::var(k).ok()))
             .collect();
         unsafe {
-            for k in keys {
+            for k in KEYS {
                 std::env::remove_var(k);
             }
         }
@@ -1383,9 +1669,11 @@ mod tests {
                 std::env::set_var(k, v);
             }
         }
+        CudaEngine::clear_worker_resources();
         f();
+        CudaEngine::clear_worker_resources();
         unsafe {
-            for k in keys {
+            for k in KEYS {
                 std::env::remove_var(k);
             }
         }
@@ -1411,12 +1699,21 @@ mod tests {
         engine_or_skip_with(1024)
     }
 
+    fn require_cuda_env() -> bool {
+        std::env::var("REQUIRE_CUDA")
+            .ok()
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    }
+
     fn engine_or_skip_with(batch_size: u32) -> Option<CudaEngine> {
         match CudaEngine::try_new(batch_size, 0) {
             Ok(e) => Some(e),
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("not available") || msg.contains("No CUDA devices") {
+                    if require_cuda_env() {
+                        panic!("REQUIRE_CUDA=1: CUDA device required but unavailable: {msg}");
+                    }
                     eprintln!("skipping CUDA test: {e}");
                     None
                 } else {
@@ -1424,6 +1721,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn engine_or_require_cuda_with(batch_size: u32) -> CudaEngine {
+        unsafe {
+            std::env::set_var("REQUIRE_CUDA", "1");
+        }
+        let engine = engine_or_skip_with(batch_size)
+            .expect("REQUIRE_CUDA=1: engine_or_skip returned None");
+        unsafe {
+            std::env::remove_var("REQUIRE_CUDA");
+        }
+        engine
     }
 
     #[test]
@@ -1486,6 +1795,7 @@ mod tests {
 
     #[test]
     fn cuda_default_mining_main_hash_nonces_match_pow_core_samples() {
+        with_isolated_cuda_env(&[], || {
         let Some(engine) = engine_or_skip() else {
             return;
         };
@@ -1508,6 +1818,7 @@ mod tests {
             }
         }
         CudaEngine::clear_worker_resources();
+        });
     }
 
     #[test]
@@ -1551,6 +1862,7 @@ mod tests {
 
     #[test]
     fn cuda_matches_nonce_hash_golden_vectors() {
+        with_isolated_cuda_env(&[], || {
         let Some(engine) = engine_or_skip() else {
             return;
         };
@@ -1565,10 +1877,12 @@ mod tests {
             assert_eq!(got[0], want, "kv {i}: CUDA hash != golden");
         }
         CudaEngine::clear_worker_resources();
+        });
     }
 
     #[test]
     fn cuda_search_matches_golden_target_boundaries() {
+        with_isolated_cuda_env(&[], || {
         let Some(engine) = engine_or_skip() else {
             return;
         };
@@ -1601,10 +1915,12 @@ mod tests {
             }
         }
         CudaEngine::clear_worker_resources();
+        });
     }
 
     #[test]
     fn cuda_hash_batches_match_cpu_across_nonce_carries() {
+        with_isolated_cuda_env(&[], || {
         let Some(engine) = engine_or_skip() else {
             return;
         };
@@ -1624,6 +1940,7 @@ mod tests {
             }
         }
         CudaEngine::clear_worker_resources();
+        });
     }
 
     const GOLDILOCKS_P: u128 = 0xffff_ffff_0000_0001;
@@ -1789,7 +2106,10 @@ mod tests {
         );
         let device = &engine.devices[0];
         let (major, minor) = device.ctx.compute_capability().unwrap();
-        let arch = major * 10 + minor;
+        let device_arch = major * 10 + minor;
+        let arch = nvrtc_ptx_target_arch(device_arch).unwrap_or_else(|e| {
+            panic!("NVRTC arch selection for sm_{device_arch}: {e}");
+        });
         let module = device
             .ctx
             .load_module(
@@ -1832,6 +2152,7 @@ mod tests {
 
     #[test]
     fn cuda_found_batch_counts_every_dispatched_nonce() {
+        with_isolated_cuda_env(&[], || {
         let batch_size = 4_000_000u32;
         let Some(engine) = engine_or_skip_with(batch_size) else {
             return;
@@ -1861,10 +2182,12 @@ mod tests {
             other => panic!("expected Found, got {other:?}"),
         }
         CudaEngine::clear_worker_resources();
+        });
     }
 
     #[test]
     fn cuda_search_rejects_prefix_equal_candidate_and_returns_lowest_valid() {
+        with_isolated_cuda_env(&[], || {
         let Some(engine) = engine_or_skip() else {
             return;
         };
@@ -1912,10 +2235,12 @@ mod tests {
             (other, expected) => panic!("unexpected {other:?} for expected {expected:?}"),
         }
         CudaEngine::clear_worker_resources();
+        });
     }
 
     #[test]
     fn cuda_search_finds_cpu_verified_solution() {
+        with_isolated_cuda_env(&[], || {
         let Some(engine) = engine_or_skip() else {
             return;
         };
@@ -1937,6 +2262,86 @@ mod tests {
             other => panic!("expected Found, got {other:?}"),
         }
         CudaEngine::clear_worker_resources();
+        });
+    }
+
+    /// PILOT-001 regression: baseline NVRTC toggles (0/0/1) vs candidate-style (1/1/8) must
+    /// match `pow_core` on golden vectors and agree on exhausted nonce-line search counts.
+    #[test]
+    fn cuda_pilot_unroll_configs_match_pow_core_and_each_other() {
+        const CONFIGS: &[(&str, &[(&str, &str)])] = &[
+            (
+                "baseline_unroll",
+                &[
+                    ("MINER_CUDA_NONCE_LINE", "1"),
+                    ("MINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL", "0"),
+                    ("MINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL", "0"),
+                    ("MINER_CUDA_NONCE_LINE_T_UNROLL", "1"),
+                ],
+            ),
+            (
+                "pilot_candidate_unroll",
+                &[
+                    ("MINER_CUDA_NONCE_LINE", "1"),
+                    ("MINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL", "1"),
+                    ("MINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL", "1"),
+                    ("MINER_CUDA_NONCE_LINE_T_UNROLL", "8"),
+                ],
+            ),
+        ];
+        let mut baseline_exhaust: Option<u64> = None;
+        for (label, vars) in CONFIGS {
+            with_isolated_cuda_env(vars, || {
+                CudaEngine::clear_worker_resources();
+                let Some(engine) = engine_or_skip_with(4096) else {
+                    eprintln!("skipping cuda_pilot_unroll_configs ({label}): no CUDA device");
+                    return;
+                };
+                if !miner_cuda_nonce_line_kernel_ready() {
+                    eprintln!("skipping cuda_pilot_unroll_configs ({label}): kernel not ready");
+                    CudaEngine::clear_worker_resources();
+                    return;
+                }
+                for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+                    let header = decode32(v.header);
+                    let nonce = U512::from_big_endian(&decode64(v.nonce));
+                    let want = U512::from_big_endian(&decode64(v.hash));
+                    let got = engine
+                        .hash_nonces(header, nonce, 1)
+                        .unwrap_or_else(|e| panic!("{label} kv {i}: {e}"));
+                    assert_eq!(got[0], want, "{label} kv {i}: CUDA hash != golden");
+                }
+                let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
+                let ctx = engine.prepare_context(header, U512::MAX);
+                let start = U512::from(0x8000u64);
+                let span = 4096u64;
+                let end = start + U512::from(span - 1);
+                let cancel = AtomicBool::new(false);
+                let status = engine.search_range(
+                    &ctx,
+                    Range { start, end },
+                    &AtomicBoolCancelCheck(&cancel),
+                );
+                let hash_count = match status {
+                    EngineStatus::Exhausted { hash_count } => hash_count,
+                    other => panic!("{label}: expected Exhausted, got {other:?}"),
+                };
+                assert_eq!(
+                    hash_count, span,
+                    "{label}: hash_count must equal dispatched nonces"
+                );
+                if label == &"baseline_unroll" {
+                    baseline_exhaust = Some(hash_count);
+                } else {
+                    assert_eq!(
+                        baseline_exhaust,
+                        Some(hash_count),
+                        "pilot candidate unroll must dispatch same nonce count as baseline toggles"
+                    );
+                }
+                CudaEngine::clear_worker_resources();
+            });
+        }
     }
 
     #[test]
@@ -2015,5 +2420,588 @@ mod tests {
                 assert_eq!(segs, expected);
             },
         );
+    }
+
+    /// Regression: NVRTC must see `gf64_mul` / `gf64_sqr` before `gf64_sbox_pair`
+    /// (mis-ordering broke Salad deploy with undefined identifier errors at field.cuh ~71).
+    #[test]
+    fn field_cuh_sbox_pair_follows_mul_and_sqr() {
+        let src = include_str!("kernels/field.cuh");
+        let mul = src
+            .find("u64 gf64_mul(")
+            .expect("field.cuh must define gf64_mul");
+        let sqr = src
+            .find("u64 gf64_sqr(")
+            .expect("field.cuh must define gf64_sqr");
+        let pair = src
+            .find("void gf64_sbox_pair(")
+            .expect("field.cuh must define gf64_sbox_pair");
+        assert!(
+            mul < pair && sqr < pair,
+            "gf64_sbox_pair must appear after gf64_mul and gf64_sqr (NVRTC forward references fail)"
+        );
+    }
+
+    /// Regression: only `cmp == 1` (hash above target) may reject; `cmp == 2` is a valid candidate.
+    #[test]
+    fn mining_entry_cu_only_rejects_cmp_eq_one() {
+        let src = include_str!("kernels/mining_entry.cu");
+        assert!(
+            src.contains("hash_high_half_cmp_be"),
+            "nonce_line path must use BE limb compare helper"
+        );
+        assert!(
+            !src.contains("if (cmp != 1u)") && !src.contains("if (cmp == 2u)"),
+            "mining_entry.cu must not reject cmp==2 (below-target hits)"
+        );
+        assert!(
+            src.matches("if (cmp == 1u)").count() >= 3,
+            "expected reject-only-on-cmp==1 at legacy, dual, and nonce_line sites"
+        );
+    }
+
+    fn with_nvrtc_env(vars: &[(&str, &str)], f: impl FnOnce()) {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+        if !keys.iter().any(|k| *k == "REQUIRE_CUDA") {
+            keys.push("REQUIRE_CUDA");
+        }
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        unsafe {
+            for k in &keys {
+                std::env::remove_var(k);
+            }
+        }
+        for (k, v) in vars {
+            unsafe {
+                std::env::set_var(k, v);
+            }
+        }
+        CudaEngine::clear_worker_resources();
+        f();
+        CudaEngine::clear_worker_resources();
+        unsafe {
+            for k in &keys {
+                std::env::remove_var(k);
+            }
+        }
+        for (k, prev) in saved {
+            unsafe {
+                if let Some(v) = prev {
+                    std::env::set_var(&k, v);
+                }
+            }
+        }
+    }
+
+    /// Matches `hash_high_half_cmp_be` / `target_cmp.cuh` (0=equal prefix, 1=reject, 2=candidate).
+    fn cpu_hash_high_half_cmp_be(first_be: &[u32; 8], tgt_hi: &[u32; 8], cmp_limbs: usize) -> u32 {
+        let n = cmp_limbs.min(8);
+        let mut cmp = 0u32;
+        for i in 0..n {
+            let h = first_be[i];
+            let t = tgt_hi[7 - i];
+            if h != t {
+                cmp = if h > t { 1 } else { 2 };
+                break;
+            }
+        }
+        if cmp == 0 && n < 8 {
+            for i in n..8 {
+                let h = first_be[i];
+                let t = tgt_hi[7 - i];
+                if h != t {
+                    cmp = if h > t { 1 } else { 2 };
+                    break;
+                }
+            }
+        }
+        cmp
+    }
+
+    fn hash_u512_to_first_be8(hash: U512) -> [u32; 8] {
+        let be = hash.to_big_endian();
+        std::array::from_fn(|i| {
+            u32::from_be_bytes(be[i * 4..i * 4 + 4].try_into().unwrap())
+        })
+    }
+
+    fn job_tgt_hi8(ctx: &JobContext) -> [u32; 8] {
+        let be = ctx.target.to_big_endian();
+        std::array::from_fn(|i| {
+            u32::from_be_bytes(be[32 + i * 4..32 + i * 4 + 4].try_into().unwrap())
+        })
+    }
+
+    fn probe_nonce_line_first_be(
+        device: &CudaDevice,
+        pk: &[u64; 14],
+        t: u32,
+    ) -> Result<[u32; 8], String> {
+        let (major, minor) = device
+            .ctx
+            .compute_capability()
+            .map_err(|e| format!("compute capability: {e}"))?;
+        let device_arch = major * 10 + minor;
+        let arch = nvrtc_ptx_target_arch(device_arch)?;
+        let source = format!(
+            "{KERNEL_SRC}\n\
+             extern \"C\" __global__ void probe_nonce_line_high_half(\n\
+                 const u64 *pk14, u32 t, u32 *out_first_be8) {{\n\
+                 u64 pk[NONCE_LINE_K_PARAMS];\n\
+                 #pragma unroll\n\
+                 for (int i = 0; i < NONCE_LINE_K_PARAMS; i++) {{ pk[i] = pk14[i]; }}\n\
+                 u64 u, v;\n\
+                 gf64_nonce_line_uv_at(pk[0], pk[1], t, u, v);\n\
+                 u32 first_be[8];\n\
+                 nonce_line_hash_high_half_from_uv(pk, u, v, first_be);\n\
+                 #pragma unroll\n\
+                 for (int i = 0; i < 8; i++) {{ out_first_be8[i] = first_be[i]; }}\n\
+             }}"
+        );
+        let module = device
+            .ctx
+            .load_module(compile_ptx_with_opts(&source, nvrtc_compile_options(arch)).map_err(
+                |e| format!("NVRTC probe compile: {e}"),
+            )?)
+            .map_err(|e| format!("load probe module: {e}"))?;
+        let function = module
+            .load_function("probe_nonce_line_high_half")
+            .map_err(|e| format!("load probe: {e}"))?;
+        let stream = device.ctx.default_stream();
+        let pk_dev = stream
+            .clone_htod(pk)
+            .map_err(|e| format!("pk h2d: {e}"))?;
+        let mut out = stream
+            .alloc_zeros::<u32>(8)
+            .map_err(|e| format!("out alloc: {e}"))?;
+        let mut launch = stream.launch_builder(&function);
+        launch.arg(&pk_dev).arg(&t).arg(&mut out);
+        unsafe {
+            launch
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+                .map_err(|e| format!("probe launch: {e}"))?;
+        }
+        stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+        let raw = stream
+            .clone_dtoh(&out)
+            .map_err(|e| format!("dtoh: {e}"))?;
+        Ok(std::array::from_fn(|i| raw[i]))
+    }
+
+    fn pilot002_baseline_nvrtc_env(cpp_out0: bool) -> Vec<(&'static str, &'static str)> {
+        let mut v = vec![
+            ("MINER_CUDA_NONCE_LINE", "1"),
+            ("MINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL", "0"),
+            ("MINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL", "0"),
+            ("MINER_CUDA_NONCE_LINE_T_UNROLL", "1"),
+            ("MINER_CUDA_NONCE_LINE_PIPE", "1"),
+            ("MINER_CUDA_NONCE_LINE_SH_PK", "1"),
+            ("MINER_CUDA_FUSED_DIAG", "1"),
+        ];
+        if cpp_out0 {
+            v.push(("MINER_CUDA_CPP_OUT0", "1"));
+        }
+        v
+    }
+
+    fn nonce_line_sample_points() -> Vec<( [u8; 32], U512, u32)> {
+        use pow_core::nonce_line::{counter_add_t, counter_with_t, T_SPAN};
+        let t_span = T_SPAN as u32;
+        let mut out = Vec::new();
+        for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+            let header = decode32(v.header);
+            let nonce = U512::from_big_endian(&decode64(v.nonce));
+            let ctr_be = nonce.to_big_endian();
+            let t = pow_core::nonce_line::t_of(&ctr_be);
+            out.push((header, nonce, t));
+            if i == 0 {
+                for &dt in &[0u32, 1, t_span - 1, t_span / 2] {
+                    let c = counter_with_t(&ctr_be, dt);
+                    out.push((header, U512::from_big_endian(&c), dt));
+                }
+            }
+        }
+        let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
+        let base = U512::from(0x8000u64);
+        let be = base.to_big_endian();
+        out.push((header, base, pow_core::nonce_line::t_of(&be)));
+        let near_k_end = counter_add_t(base, t_span - 1);
+        let be2 = near_k_end.to_big_endian();
+        out.push((
+            header,
+            near_k_end,
+            pow_core::nonce_line::t_of(&be2),
+        ));
+        let mut seed = 0xca7a_f00d_u64;
+        for _ in 0..128 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let ctr = U512::from(seed);
+            let be = ctr.to_big_endian();
+            let t = pow_core::nonce_line::t_of(&be) % t_span;
+            let c = counter_with_t(&be, t);
+            out.push((header, U512::from_big_endian(&c), t));
+        }
+        out
+    }
+
+    fn nonce_line_uv_at(pk0: u64, pk1: u64, t: u32) -> (u64, u64) {
+        pow_core::nonce_line::uv_at(pk0, pk1, t)
+    }
+
+    /// Build `tgt_hi[8]` for `hash_high_half_cmp_be` (index `7 - i` compares to `first_be[i]`).
+    fn tgt_hi_matching_first_be(first_be: &[u32; 8]) -> [u32; 8] {
+        let mut tgt = [0u32; 8];
+        for i in 0..8 {
+            tgt[7 - i] = first_be[i];
+        }
+        tgt
+    }
+
+    fn tgt_hi_with_limb_delta(first_be: &[u32; 8], limb: usize, delta: i64) -> [u32; 8] {
+        let mut tgt = tgt_hi_matching_first_be(first_be);
+        let idx = 7 - limb;
+        if delta >= 0 {
+            tgt[idx] = tgt[idx].saturating_add(delta as u32);
+        } else {
+            tgt[idx] = tgt[idx].saturating_sub((-delta) as u32);
+        }
+        tgt
+    }
+
+    /// Limbs 0–1 match `first_be`; limb 2+ set high so comparison proceeds past a tied prefix.
+    fn tgt_hi_adversarial_equal_prefix_differ_later(first_be: &[u32; 8]) -> [u32; 8] {
+        let mut tgt = tgt_hi_matching_first_be(first_be);
+        for limb in 2..8 {
+            tgt[7 - limb] = 0xffff_ffff;
+        }
+        tgt
+    }
+
+    fn assert_no_false_negative_filter(
+        label: &str,
+        case: &str,
+        cpu_cmp: u32,
+        gpu_cmp: u32,
+    ) {
+        assert_eq!(
+            gpu_cmp, cpu_cmp,
+            "{label} {case}: GPU cmp {gpu_cmp} != CPU cmp {cpu_cmp}"
+        );
+        if cpu_cmp != 1 {
+            assert_ne!(
+                gpu_cmp, 1,
+                "{label} {case}: false negative — CPU accepts filter but GPU rejects"
+            );
+        }
+    }
+
+    /// PILOT-002: CPP_OUT0 must match legacy high-half filter decisions and dispatch; no false negatives vs CPU.
+    #[test]
+    fn cuda_cpp_out0_matches_pow_core_high_half_and_dispatch() {
+        const CONFIGS: &[(&str, bool)] = &[("legacy_perm", false), ("cpp_out0", true)];
+        let cmp_limbs = cuda_cmp_limbs() as usize;
+        let mut legacy_exhaust: Option<u64> = None;
+        let mut legacy_probes: Option<Vec<([u32; 8], u32, U512)>> = None;
+
+        for (label, cpp_out0) in CONFIGS {
+            let env = pilot002_baseline_nvrtc_env(*cpp_out0);
+            with_nvrtc_env(&env, || {
+                CudaEngine::clear_worker_resources();
+                let Some(engine) = engine_or_skip_with(8192) else {
+                    if require_cuda_env() {
+                        panic!("REQUIRE_CUDA=1: CUDA device required for {label}");
+                    }
+                    eprintln!("skipping cuda_cpp_out0 ({label}): no CUDA device");
+                    return;
+                };
+                assert!(
+                    miner_cuda_nonce_line_kernel_ready(),
+                    "nonce-line kernel not ready ({label})"
+                );
+                let device = &engine.devices[0];
+                let mut probe_rows = Vec::new();
+
+                for (header, counter, t) in nonce_line_sample_points() {
+                    let ctx = engine.prepare_context(header, U512::MAX);
+                    let pk_arr =
+                        pow_core::nonce_line::segment_launch_params(header, counter);
+                    let _ = nonce_line_uv_at(pk_arr[0], pk_arr[1], t);
+                    let first_be = probe_nonce_line_first_be(device, &pk_arr, t)
+                        .unwrap_or_else(|e| panic!("{label} probe at t={t}: {e}"));
+                    let nonce = pow_core::nonce_line::nonce_from_absolute_t(counter, t);
+                    let full = pow_core::hash_from_nonce(&ctx, nonce);
+                    let cpu_first = hash_u512_to_first_be8(full);
+                    let tgt_hi = job_tgt_hi8(&ctx);
+                    let cpu_cmp = cpu_hash_high_half_cmp_be(&cpu_first, &tgt_hi, cmp_limbs);
+                    let gpu_cmp = cpu_hash_high_half_cmp_be(&first_be, &tgt_hi, cmp_limbs);
+
+                    if !cpp_out0 {
+                        assert_eq!(
+                            first_be, cpu_first,
+                            "{label}: GPU legacy first_be != CPU full hash prefix at t={t}"
+                        );
+                    } else if let Some(ref leg_rows) = legacy_probes {
+                        let leg = leg_rows
+                            .iter()
+                            .find(|r| r.1 == t && r.2 == counter)
+                            .unwrap_or_else(|| {
+                                panic!("missing legacy probe for counter={counter} t={t}")
+                            });
+                        assert_eq!(
+                            first_be[0], leg.0[0],
+                            "cpp_out0 limb0 mismatch at t={t}"
+                        );
+                        assert_eq!(
+                            first_be[1], leg.0[1],
+                            "cpp_out0 limb1 mismatch at t={t}"
+                        );
+                        for i in 2..8 {
+                            assert_eq!(
+                                first_be[i], 0,
+                                "cpp_out0 must zero limbs 2..7 at t={t}, got [{}]={}",
+                                i,
+                                first_be[i]
+                            );
+                        }
+                        let leg_cmp = cpu_hash_high_half_cmp_be(&leg.0, &tgt_hi, cmp_limbs);
+                        assert_eq!(
+                            gpu_cmp, leg_cmp,
+                            "cpp_out0 filter decision != legacy at t={t} (false negative/positive risk)"
+                        );
+                    }
+
+                    assert_eq!(
+                        gpu_cmp, cpu_cmp,
+                        "{label}: GPU filter cmp {gpu_cmp} != CPU cmp {cpu_cmp} at t={t} \
+                         (false negative if CPU accepts and GPU rejects)"
+                    );
+                    probe_rows.push((first_be, t, counter));
+                }
+
+                let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
+                let base = U512::from(0x9000u64);
+                let pk_arr = pow_core::nonce_line::segment_launch_params(header, base);
+                let probe0 = probe_nonce_line_first_be(device, &pk_arr, 0)
+                    .expect("target sweep probe");
+                let nonce0 = pow_core::nonce_line::nonce_from_absolute_t(base, 0);
+                let cpu_first0 = hash_u512_to_first_be8(pow_core::hash_from_nonce(
+                    &JobContext::new(header, U512::MAX),
+                    nonce0,
+                ));
+                let mut seed = 0xdead_beef_u64;
+                for _ in 0..64 {
+                    seed ^= seed << 7;
+                    seed ^= seed >> 9;
+                    seed ^= seed << 8;
+                    let target = U512::from(seed) | (U512::one() << 255);
+                    let tgt_hi = job_tgt_hi8(&JobContext::new(header, target));
+                    let cpu_cmp = cpu_hash_high_half_cmp_be(&cpu_first0, &tgt_hi, cmp_limbs);
+                    let gpu_cmp = cpu_hash_high_half_cmp_be(&probe0, &tgt_hi, cmp_limbs);
+                    assert_no_false_negative_filter(label, "random_target", cpu_cmp, gpu_cmp);
+                }
+
+                let leg0 = if *label == "legacy_perm" {
+                    probe0
+                } else {
+                    legacy_probes
+                        .as_ref()
+                        .and_then(|rows| {
+                            rows.iter()
+                                .find(|r| r.1 == 0 && r.2 == base)
+                                .map(|r| r.0)
+                        })
+                        .expect("legacy probe for adversarial base")
+                };
+                for limb in 0..8 {
+                    for (case, tgt_hi) in [
+                        (
+                            "exact",
+                            tgt_hi_matching_first_be(&leg0),
+                        ),
+                        (
+                            "limb_below",
+                            tgt_hi_with_limb_delta(&leg0, limb, -1),
+                        ),
+                        (
+                            "limb_above",
+                            tgt_hi_with_limb_delta(&leg0, limb, 1),
+                        ),
+                    ] {
+                        let cpu_cmp =
+                            cpu_hash_high_half_cmp_be(&cpu_first0, &tgt_hi, cmp_limbs);
+                        let gpu_cmp = cpu_hash_high_half_cmp_be(&probe0, &tgt_hi, cmp_limbs);
+                        assert_no_false_negative_filter(
+                            label,
+                            &format!("boundary_{case}_limb{limb}"),
+                            cpu_cmp,
+                            gpu_cmp,
+                        );
+                        if *label == "cpp_out0" {
+                            let leg_cmp =
+                                cpu_hash_high_half_cmp_be(&leg0, &tgt_hi, cmp_limbs);
+                            assert_eq!(
+                                gpu_cmp, leg_cmp,
+                                "cpp_out0 {case} limb{limb}: must match legacy filter decision"
+                            );
+                        }
+                    }
+                }
+                let adv = tgt_hi_adversarial_equal_prefix_differ_later(&leg0);
+                let cpu_adv = cpu_hash_high_half_cmp_be(&cpu_first0, &adv, cmp_limbs);
+                let gpu_adv = cpu_hash_high_half_cmp_be(&probe0, &adv, cmp_limbs);
+                assert_no_false_negative_filter(label, "adversarial_prefix_eq_later_diff", cpu_adv, gpu_adv);
+                if *label == "cpp_out0" {
+                    let leg_adv = cpu_hash_high_half_cmp_be(&leg0, &adv, cmp_limbs);
+                    assert_eq!(
+                        gpu_adv, leg_adv,
+                        "cpp_out0 adversarial: must match legacy (OUT0 zero limbs 2..7 vs full cmp)"
+                    );
+                }
+
+                for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+                    let header = decode32(v.header);
+                    let nonce = U512::from_big_endian(&decode64(v.nonce));
+                    let cancel = AtomicBool::new(false);
+                    let hash = U512::from_big_endian(&decode64(v.hash));
+                    for target in [hash - U512::one(), hash, hash + U512::one()] {
+                        let ctx_t = JobContext {
+                            header,
+                            difficulty: U512::one(),
+                            target,
+                        };
+                        let status = engine.search_range(
+                            &ctx_t,
+                            Range {
+                                start: nonce,
+                                end: nonce,
+                            },
+                            &AtomicBoolCancelCheck(&cancel),
+                        );
+                        let cpu_ok = hash < target;
+                        match (status, cpu_ok) {
+                            (
+                                EngineStatus::Found { candidate, .. },
+                                true,
+                            ) => {
+                                assert_eq!(candidate.nonce, nonce, "{label} kv {i}");
+                                assert_eq!(
+                                    candidate.hash,
+                                    pow_core::hash_from_nonce(&ctx_t, candidate.nonce),
+                                    "{label} golden kv {i}: full hash mismatch on hit"
+                                );
+                            }
+                            (EngineStatus::Exhausted { hash_count: 1 }, false) => {}
+                            (other, cpu_ok) => panic!(
+                                "{label} golden kv {i} target {target} cpu_ok={cpu_ok}: {other:?}"
+                            ),
+                        }
+                    }
+                }
+
+                let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
+                let ctx = engine.prepare_context(header, U512::MAX);
+                let start = U512::from(0x8000u64);
+                let span = 4096u64;
+                let end = start + U512::from(span - 1);
+                let cancel = AtomicBool::new(false);
+                let status = engine.search_range(
+                    &ctx,
+                    Range { start, end },
+                    &AtomicBoolCancelCheck(&cancel),
+                );
+                let hash_count = match status {
+                    EngineStatus::Exhausted { hash_count } => hash_count,
+                    EngineStatus::Found { hash_count, candidate, .. } => {
+                        assert_eq!(
+                            candidate.hash,
+                            pow_core::hash_from_nonce(&ctx, candidate.nonce),
+                            "{label}: hit hash must match pow_core"
+                        );
+                        hash_count
+                    }
+                    other => panic!("{label}: expected Exhausted or Found, got {other:?}"),
+                };
+                assert_eq!(
+                    hash_count, span,
+                    "{label}: dispatch count must equal span"
+                );
+
+                let ctx_hit = engine.prepare_context(header, U512::MAX);
+                let cancel = AtomicBool::new(false);
+                if let EngineStatus::Found {
+                    candidate,
+                    hash_count: 1,
+                    ..
+                } = engine.search_range(
+                    &ctx_hit,
+                    Range {
+                        start,
+                        end: start,
+                    },
+                    &AtomicBoolCancelCheck(&cancel),
+                ) {
+                    assert_eq!(
+                        candidate.hash,
+                        pow_core::hash_from_nonce(&ctx_hit, candidate.nonce),
+                        "{label}: single-nonce hit hash"
+                    );
+                }
+
+                if *label == "legacy_perm" {
+                    legacy_exhaust = Some(hash_count);
+                    legacy_probes = Some(probe_rows);
+                } else {
+                    assert_eq!(
+                        legacy_exhaust,
+                        Some(hash_count),
+                        "cpp_out0 dispatch count must match legacy"
+                    );
+                }
+                CudaEngine::clear_worker_resources();
+            });
+        }
+    }
+
+    /// Salad RTX 5090 default NVRTC `-D` profile (from quantus-live-001 deploy log).
+    #[test]
+    fn nvrtc_compiles_mining_kernel_with_salad_default_flags() {
+        let salad_env = [
+            ("MINER_CUDA_GF64_32BIT", "1"),
+            ("MINER_CUDA_MIN_BLOCKS", "4"),
+            ("MINER_CUDA_NONCE_LINE", "1"),
+            ("MINER_CUDA_NONCE_LINE_SH_PK", "1"),
+            ("MINER_CUDA_NONCE_LINE_PIPE", "1"),
+            ("MINER_CUDA_FUSED_DIAG", "1"),
+        ];
+        with_nvrtc_env(&salad_env, || {
+            let opts = nvrtc_compile_options(90);
+            let ptx = silent_catch(|| compile_ptx_with_opts(KERNEL_SRC, opts));
+            match ptx {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    let msg = e.to_string();
+                    if msg.contains("not available") || msg.contains("libnvrtc") {
+                        eprintln!("skipping NVRTC compile test: {msg}");
+                        return;
+                    }
+                    panic!("NVRTC compile failed with Salad-like flags: {msg}");
+                }
+                Err(_) => {
+                    eprintln!("skipping NVRTC compile test: libnvrtc not loadable on this host");
+                }
+            }
+        });
     }
 }

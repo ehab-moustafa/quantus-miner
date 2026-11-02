@@ -236,9 +236,11 @@ fn xorshift(state: &mut u64) -> u64 {
 }
 
 fn set_perf_qos() {
+    #[cfg(target_os = "macos")]
     unsafe extern "C" {
         fn pthread_set_qos_class_self_np(class: u32, relative: i32) -> i32;
     }
+    #[cfg(target_os = "macos")]
     // QOS_CLASS_USER_INTERACTIVE, so samples stay on a performance core.
     unsafe {
         pthread_set_qos_class_self_np(0x21, 0);
