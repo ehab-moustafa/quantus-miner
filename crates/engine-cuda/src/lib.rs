@@ -1648,7 +1648,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         const KEYS: &[&str] = &[
-            "REQUIRE_CUDA",
             "MINER_CUDA_NONCE_LINE",
             "MINER_CUDA_K_SEGMENT",
             "MINER_CUDA_CPP_OUT0",
