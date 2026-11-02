@@ -32,12 +32,12 @@ fn increment_absorb_chain(absorb: &mut [Goldilocks; 8], prev_be: &[u8; 64], next
     for (i, felt) in absorb.iter_mut().enumerate() {
         let off = 32 + 4 * i;
         if prev_be[off..off + 4] != next_be[off..off + 4] {
-            *felt += Goldilocks::from_u64(
-                u32::from_le_bytes(next_be[off..off + 4].try_into().unwrap()) as u64,
-            );
-            *felt -= Goldilocks::from_u64(
-                u32::from_le_bytes(prev_be[off..off + 4].try_into().unwrap()) as u64,
-            );
+            *felt += Goldilocks::from_u64(u32::from_le_bytes(
+                next_be[off..off + 4].try_into().unwrap(),
+            ) as u64);
+            *felt -= Goldilocks::from_u64(u32::from_le_bytes(
+                prev_be[off..off + 4].try_into().unwrap(),
+            ) as u64);
         }
     }
 }

@@ -328,7 +328,8 @@ extern "C" __global__ void __launch_bounds__(MINER_CUDA_NONCE_LINE_LAUNCH_THREAD
             break;
         }
         u32 first_be[8];
-        nonce_line_hash_high_half_from_uv(pk, line_u, line_v, first_be);
+        nonce_line_hash_high_half_from_uv_prestate(pk, line_u, line_v, params.prestate,
+                                                   params.nonce_line_k_base, t, first_be);
         gf64_nonce_line_uv_step(line_u, line_v);
         u32 cmp = hash_high_half_cmp_be(first_be, tgt_hi);
         if (cmp == 1u) {

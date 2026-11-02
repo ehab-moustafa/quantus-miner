@@ -35,10 +35,7 @@ pub fn gf64_add_u64(a: u64, b: u64) -> u64 {
 #[inline]
 pub fn uv_at(pk0: u64, pk1: u64, t: u32) -> (u64, u64) {
     let d = 35u64.wrapping_mul(u64::from(t));
-    (
-        gf64_add_u64(pk0, P64.wrapping_sub(d)),
-        gf64_add_u64(pk1, d),
-    )
+    (gf64_add_u64(pk0, P64.wrapping_sub(d)), gf64_add_u64(pk1, d))
 }
 
 /// Bits `[pos, pos + len)` of the 256-bit big-endian number in `b[0..32]`.
@@ -46,11 +43,7 @@ pub fn bits256_be(b: &[u8; 32], pos: usize, len: usize) -> u32 {
     let mut r = 0u32;
     for i in (0..len).rev() {
         let bit = pos + i;
-        let byte = if bit < 256 {
-            b[31 - bit / 8]
-        } else {
-            0
-        };
+        let byte = if bit < 256 { b[31 - bit / 8] } else { 0 };
         r = (r << 1) | ((byte >> (bit % 8)) & 1) as u32;
     }
     r
@@ -75,9 +68,7 @@ pub fn k_of(counter_be: &[u8; 64]) -> u64 {
 /// `B(k)` absorb words for this counter's `k` (CPPminer `base_words`).
 pub fn base_words(counter_be: &[u8; 64]) -> [u32; 8] {
     let low: [u8; 32] = counter_be[32..64].try_into().unwrap();
-    std::array::from_fn(|i| {
-        0x8000_0000 | bits256_be(&low, T_BITS as usize + 29 * i, 29)
-    })
+    std::array::from_fn(|i| 0x8000_0000 | bits256_be(&low, T_BITS as usize + 29 * i, 29))
 }
 
 /// Map counter → 64-byte big-endian nonce (pool / `get_nonce_hash` layout).

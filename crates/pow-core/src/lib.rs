@@ -2,8 +2,10 @@ use primitive_types::U512;
 use qp_poseidon_core::poseidon2::INITIAL_EXTERNAL_CONSTANTS;
 use qp_poseidon_core::{Goldilocks, Poseidon2};
 
+pub mod cuda_gf64;
 pub mod custom;
 pub mod nonce_line;
+pub mod nonce_line_filter;
 
 pub use qp_poseidon_core::SPONGE_WIDTH;
 pub use qpow_math::{get_nonce_hash, is_valid_nonce, mine_range};

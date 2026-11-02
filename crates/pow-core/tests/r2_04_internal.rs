@@ -264,8 +264,12 @@ fn edge_states() -> Vec<[Goldilocks; SPONGE_WIDTH]> {
         [Goldilocks::new(u64::MAX); SPONGE_WIDTH],
         [Goldilocks::new(0xFFFF_FFFF_0000_0001); SPONGE_WIDTH],
         [Goldilocks::new(0xFFFF_FFFF_0000_0000); SPONGE_WIDTH],
-        core::array::from_fn(|i| Goldilocks::new(0xFFFF_FFFF_0000_0001u64.wrapping_add(i as u64 * 17))),
-        core::array::from_fn(|i| Goldilocks::new(INTERNAL_CONSTANTS[i % INTERNAL_ROUNDS].wrapping_add(i as u64))),
+        core::array::from_fn(|i| {
+            Goldilocks::new(0xFFFF_FFFF_0000_0001u64.wrapping_add(i as u64 * 17))
+        }),
+        core::array::from_fn(|i| {
+            Goldilocks::new(INTERNAL_CONSTANTS[i % INTERNAL_ROUNDS].wrapping_add(i as u64))
+        }),
     ]
 }
 
@@ -290,8 +294,16 @@ fn assert_canonical_equality() {
     let mut seq_alt = sequential;
     lib_internal_linear_layer(&mut seq_lib, &DIAG);
     alt_internal_linear_layer(&mut seq_alt);
-    assert_eq!(canon(&seq_lib), expected, "library layer drifted from qp-poseidon-core vector");
-    assert_eq!(canon(&seq_alt), expected, "unrolled diag drifted from qp-poseidon-core vector");
+    assert_eq!(
+        canon(&seq_lib),
+        expected,
+        "library layer drifted from qp-poseidon-core vector"
+    );
+    assert_eq!(
+        canon(&seq_alt),
+        expected,
+        "unrolled diag drifted from qp-poseidon-core vector"
+    );
 
     let mut rng = 0x6a09e667f3bcc908u64;
     for n in 0..10_000 {

@@ -165,8 +165,8 @@ pub fn miner_cuda_nonce_line_kernel_ready() -> bool {
     true
 }
 
-/// Experimental CPPminer partial digest path (`-DMINER_CUDA_CPP_OUT0` at NVRTC).
-/// See `kernels/cpp_out0.cuh` — not linked into `mining_main` yet.
+/// CPPminer partial digest path (`-DMINER_CUDA_CPP_OUT0` at NVRTC for `mining_main_nonce_line`).
+/// See `kernels/cpp_out0.cuh` and `nonce_line.cuh` dispatch.
 fn cuda_cpp_out0_enabled() -> bool {
     cuda_flag_on("MINER_CUDA_CPP_OUT0")
 }
@@ -194,14 +194,12 @@ fn cuda_out0_g_partial_enabled() -> bool {
 
 /// Experimental `ext_layer64` pass-2 scheduling (`-DMINER_CUDA_EXT_V2` at NVRTC).
 fn cuda_ext_v2_enabled() -> bool {
-    std::env::var("MINER_CUDA_EXT_V2")
-        .ok()
-        .is_some_and(|v| {
-            matches!(
-                v.as_str(),
-                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
-            )
-        })
+    std::env::var("MINER_CUDA_EXT_V2").ok().is_some_and(|v| {
+        matches!(
+            v.as_str(),
+            "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+        )
+    })
 }
 
 /// Skip rare second Goldilocks carry fold on nonce / `t` steps (#110 item 3).
@@ -512,7 +510,11 @@ fn mining_params_for_segment(
     let counter_be = segment_start.to_big_endian();
     let nonce_be = counter_be;
     let start_limbs = pow_core::u512_to_le_u32s(segment_start);
-    let prestate = pow_core::mining_prestate_low64_u32s(ctx.header, nonce_be);
+    let prestate = if cuda_use_nonce_line() {
+        pow_core::mining_midstate_u32s(ctx.header, counter_be[..32].try_into().unwrap())
+    } else {
+        pow_core::mining_prestate_low64_u32s(ctx.header, nonce_be)
+    };
     let target = pow_core::u512_to_le_u32s(ctx.target);
     let k_base = pow_core::nonce_line::base_words(&counter_be);
     let (pk, t_base) = if cuda_use_nonce_line() {
@@ -817,9 +819,8 @@ fn compile_kernel(major: i32, minor: i32) -> Result<Ptx, Box<dyn std::error::Err
 }
 
 fn cuda_kernel_include_dir() -> String {
-    std::env::var("MINER_CUDA_KERNEL_DIR").unwrap_or_else(|_| {
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernels").to_string()
-    })
+    std::env::var("MINER_CUDA_KERNEL_DIR")
+        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/src/kernels").to_string())
 }
 
 fn cuda_gf64_32bit_flag() -> i32 {
@@ -838,6 +839,14 @@ fn cuda_gf64_32bit_flag() -> i32 {
 }
 
 fn nvrtc_compile_options(gpu_arch: i32) -> CompileOptions {
+    nvrtc_compile_options_inner(gpu_arch, true)
+}
+
+fn nvrtc_compile_options_probe_pow(gpu_arch: i32) -> CompileOptions {
+    nvrtc_compile_options_inner(gpu_arch, false)
+}
+
+fn nvrtc_compile_options_inner(gpu_arch: i32, include_cpp_out0: bool) -> CompileOptions {
     let kernel_dir = cuda_kernel_include_dir();
     let gf64_32bit = cuda_gf64_32bit_flag();
     let mut options = vec![
@@ -860,7 +869,9 @@ fn nvrtc_compile_options(gpu_arch: i32) -> CompileOptions {
     if cuda_fused_diag_enabled() {
         options.push("-DMINER_CUDA_FUSED_DIAG".into());
     }
-    if cuda_pipe_sbox_enabled() || cuda_nonce_line_pipe_enabled() {
+    if include_cpp_out0 && (cuda_pipe_sbox_enabled() || cuda_nonce_line_pipe_enabled()) {
+        options.push("-DMINER_CUDA_PIPE_SBOX".into());
+    } else if !include_cpp_out0 && cuda_pipe_sbox_enabled() {
         options.push("-DMINER_CUDA_PIPE_SBOX".into());
     }
     if cuda_dual_enabled() {
@@ -875,21 +886,21 @@ fn nvrtc_compile_options(gpu_arch: i32) -> CompileOptions {
     if cuda_lazy_carry_enabled() {
         options.push("-DMINER_CUDA_LAZY_CARRY=1".into());
     }
-    if cuda_cpp_out0_enabled() {
+    if include_cpp_out0 && cuda_cpp_out0_enabled() {
         options.push("-DMINER_CUDA_CPP_OUT0=1".into());
     }
-    if cuda_out0_lazy_w_enabled() {
+    if include_cpp_out0 && cuda_out0_lazy_w_enabled() {
         options.push("-DMINER_CUDA_OUT0_LAZY_W=1".into());
     }
-    if cuda_out0_g_unroll_enabled() {
+    if include_cpp_out0 && cuda_out0_g_unroll_enabled() {
         options.push("-DMINER_CUDA_OUT0_G_UNROLL=1".into());
     }
-    if cuda_out0_ext_unroll_enabled() {
+    if include_cpp_out0 && cuda_out0_ext_unroll_enabled() {
         options.push("-DMINER_CUDA_OUT0_EXT_UNROLL=1".into());
     }
-    if cuda_out0_g_partial9_enabled() {
+    if include_cpp_out0 && cuda_out0_g_partial9_enabled() {
         options.push("-DMINER_CUDA_OUT0_G_PARTIAL9=1".into());
-    } else if cuda_out0_g_partial_enabled() {
+    } else if include_cpp_out0 && cuda_out0_g_partial_enabled() {
         options.push("-DMINER_CUDA_OUT0_G_PARTIAL=1".into());
     }
     if cuda_nonce_line_sh_pk_enabled() {
@@ -991,10 +1002,13 @@ fn upload_params_sync(
     slot: usize,
 ) -> Result<(), BatchResult> {
     buffers.params_h2d_ready[slot] = None;
-    buffers.stream.memcpy_htod(std::slice::from_ref(params), &mut buffers.params_dev[slot]).map_err(|e| {
-        log::error!(target: "cuda_engine", "CUDA params upload failed: {e}");
-        BatchResult::DeviceLost
-    })?;
+    buffers
+        .stream
+        .memcpy_htod(std::slice::from_ref(params), &mut buffers.params_dev[slot])
+        .map_err(|e| {
+            log::error!(target: "cuda_engine", "CUDA params upload failed: {e}");
+            BatchResult::DeviceLost
+        })?;
     Ok(())
 }
 
@@ -1003,10 +1017,7 @@ fn upload_params_async(
     params: &MiningParams,
     slot: usize,
 ) -> Result<(), BatchResult> {
-    let copy = buffers
-        .copy_stream
-        .as_ref()
-        .expect("pipeline copy stream");
+    let copy = buffers.copy_stream.as_ref().expect("pipeline copy stream");
     copy.memcpy_htod(std::slice::from_ref(params), &mut buffers.params_dev[slot])
         .map_err(|e| {
             log::error!(target: "cuda_engine", "CUDA async params upload failed: {e}");
@@ -1186,8 +1197,7 @@ fn run_mining_segment(
         }
     };
 
-    let dispatched =
-        (total_threads as u64 * nonces_per_thread as u64).min(segment_size as u64);
+    let dispatched = (total_threads as u64 * nonces_per_thread as u64).min(segment_size as u64);
     let best = process_segment_hits(&result_u32s, segment_start, ctx, seg_ctx, dispatched)?;
     Ok((best, dispatched))
 }
@@ -1271,13 +1281,8 @@ fn run_single_batch_pipelined(
                     0
                 }
             } else {
-                let params = mining_params_for_segment(
-                    ctx,
-                    segment_start,
-                    segment_size,
-                    dispatch,
-                    &seg_ctx,
-                );
+                let params =
+                    mining_params_for_segment(ctx, segment_start, segment_size, dispatch, &seg_ctx);
                 if let Err(e) = upload_params_sync(buffers, &params, 0) {
                     return e;
                 }
@@ -1287,8 +1292,13 @@ fn run_single_batch_pipelined(
             buffers.param_slot as usize
         };
 
-        if let Err(e) = launch_mining_kernel(buffers, slot, num_blocks, threads_per_block, segment_index > 0)
-        {
+        if let Err(e) = launch_mining_kernel(
+            buffers,
+            slot,
+            num_blocks,
+            threads_per_block,
+            segment_index > 0,
+        ) {
             return e;
         }
 
@@ -1320,8 +1330,7 @@ fn run_single_batch_pipelined(
             }
         };
 
-        let dispatched =
-            (total_threads as u64 * nonces_per_thread as u64).min(segment_size as u64);
+        let dispatched = (total_threads as u64 * nonces_per_thread as u64).min(segment_size as u64);
         match process_segment_hits(&result_u32s, segment_start, ctx, &seg_ctx, dispatched) {
             Ok(best) => {
                 total_dispatched += dispatched;
@@ -1356,11 +1365,7 @@ fn run_single_batch_pipelined(
     }
 }
 
-fn batch_size_for_start(
-    range: &Range,
-    current_start: U512,
-    engine_batch_size: u32,
-) -> u32 {
+fn batch_size_for_start(range: &Range, current_start: U512, engine_batch_size: u32) -> u32 {
     let remaining = range
         .end
         .saturating_sub(current_start)
@@ -1539,8 +1544,7 @@ impl MinerEngine for CudaEngine {
                 };
             }
 
-            let this_batch_size =
-                batch_size_for_start(&range, current_start, self.batch_size);
+            let this_batch_size = batch_size_for_start(&range, current_start, self.batch_size);
             let next_start = current_start.saturating_add(U512::from(this_batch_size));
             let next_batch = (next_start <= range.end).then(|| {
                 (
@@ -1726,8 +1730,8 @@ mod tests {
         unsafe {
             std::env::set_var("REQUIRE_CUDA", "1");
         }
-        let engine = engine_or_skip_with(batch_size)
-            .expect("REQUIRE_CUDA=1: engine_or_skip returned None");
+        let engine =
+            engine_or_skip_with(batch_size).expect("REQUIRE_CUDA=1: engine_or_skip returned None");
         unsafe {
             std::env::remove_var("REQUIRE_CUDA");
         }
@@ -1795,53 +1799,53 @@ mod tests {
     #[test]
     fn cuda_default_mining_main_hash_nonces_match_pow_core_samples() {
         with_isolated_cuda_env(&[], || {
-        let Some(engine) = engine_or_skip() else {
-            return;
-        };
-        for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
-            let header = decode32(v.header);
-            let ctx = engine.prepare_context(header, U512::one());
-            let start = U512::from_big_endian(&decode64(v.nonce));
-            let count = 33u32;
-            let gpu = engine
-                .hash_nonces(header, start, count)
-                .unwrap_or_else(|e| panic!("kv {i}: hash_nonces failed: {e}"));
-            assert_eq!(gpu.len(), count as usize);
-            for (j, hash) in gpu.into_iter().enumerate() {
-                let nonce = start + U512::from(j);
-                assert_eq!(
-                    hash,
-                    pow_core::hash_from_nonce(&ctx, nonce),
-                    "kv {i} offset {j}"
-                );
+            let Some(engine) = engine_or_skip() else {
+                return;
+            };
+            for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+                let header = decode32(v.header);
+                let ctx = engine.prepare_context(header, U512::one());
+                let start = U512::from_big_endian(&decode64(v.nonce));
+                let count = 33u32;
+                let gpu = engine
+                    .hash_nonces(header, start, count)
+                    .unwrap_or_else(|e| panic!("kv {i}: hash_nonces failed: {e}"));
+                assert_eq!(gpu.len(), count as usize);
+                for (j, hash) in gpu.into_iter().enumerate() {
+                    let nonce = start + U512::from(j);
+                    assert_eq!(
+                        hash,
+                        pow_core::hash_from_nonce(&ctx, nonce),
+                        "kv {i} offset {j}"
+                    );
+                }
             }
-        }
-        CudaEngine::clear_worker_resources();
+            CudaEngine::clear_worker_resources();
         });
     }
 
     #[test]
     fn cuda_mining_main_search_multisegment_exhausted_matches_pow_core_count() {
         with_isolated_cuda_env(&[("MINER_CUDA_K_SEGMENT", "1000")], || {
-        let Some(engine) = engine_or_skip_with(3000) else {
-            return;
-        };
-        let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
-        let ctx = JobContext {
-            header,
-            difficulty: U512::one(),
-            target: U512::zero(),
-        };
-        let start = U512::from(0x5000u64);
-        let span = 2500u64;
-        let end = start + U512::from(span - 1);
-        let cancel = AtomicBool::new(false);
-        match engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)) {
-            EngineStatus::Exhausted { hash_count } => {
-                assert_eq!(hash_count, span);
+            let Some(engine) = engine_or_skip_with(3000) else {
+                return;
+            };
+            let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
+            let ctx = JobContext {
+                header,
+                difficulty: U512::one(),
+                target: U512::zero(),
+            };
+            let start = U512::from(0x5000u64);
+            let span = 2500u64;
+            let end = start + U512::from(span - 1);
+            let cancel = AtomicBool::new(false);
+            match engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)) {
+                EngineStatus::Exhausted { hash_count } => {
+                    assert_eq!(hash_count, span);
+                }
+                other => panic!("expected Exhausted over k-segment batch, got {other:?}"),
             }
-            other => panic!("expected Exhausted over k-segment batch, got {other:?}"),
-        }
         });
         CudaEngine::clear_worker_resources();
     }
@@ -1862,83 +1866,83 @@ mod tests {
     #[test]
     fn cuda_matches_nonce_hash_golden_vectors() {
         with_isolated_cuda_env(&[], || {
-        let Some(engine) = engine_or_skip() else {
-            return;
-        };
-        for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
-            let header = decode32(v.header);
-            let nonce = U512::from_big_endian(&decode64(v.nonce));
-            let want = U512::from_big_endian(&decode64(v.hash));
-            let got = engine
-                .hash_nonces(header, nonce, 1)
-                .unwrap_or_else(|e| panic!("kv {i}: CUDA hash_nonces failed: {e}"));
-            assert_eq!(got.len(), 1, "kv {i}");
-            assert_eq!(got[0], want, "kv {i}: CUDA hash != golden");
-        }
-        CudaEngine::clear_worker_resources();
+            let Some(engine) = engine_or_skip() else {
+                return;
+            };
+            for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+                let header = decode32(v.header);
+                let nonce = U512::from_big_endian(&decode64(v.nonce));
+                let want = U512::from_big_endian(&decode64(v.hash));
+                let got = engine
+                    .hash_nonces(header, nonce, 1)
+                    .unwrap_or_else(|e| panic!("kv {i}: CUDA hash_nonces failed: {e}"));
+                assert_eq!(got.len(), 1, "kv {i}");
+                assert_eq!(got[0], want, "kv {i}: CUDA hash != golden");
+            }
+            CudaEngine::clear_worker_resources();
         });
     }
 
     #[test]
     fn cuda_search_matches_golden_target_boundaries() {
         with_isolated_cuda_env(&[], || {
-        let Some(engine) = engine_or_skip() else {
-            return;
-        };
-        let cancel = AtomicBool::new(false);
-        for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
-            let nonce = U512::from_big_endian(&decode64(v.nonce));
-            let hash = U512::from_big_endian(&decode64(v.hash));
-            for target in [hash - U512::one(), hash, hash + U512::one()] {
-                let ctx = JobContext {
-                    header: decode32(v.header),
-                    difficulty: U512::one(),
-                    target,
-                };
-                let status = engine.search_range(
-                    &ctx,
-                    Range {
-                        start: nonce,
-                        end: nonce,
-                    },
-                    &AtomicBoolCancelCheck(&cancel),
-                );
-                match status {
-                    EngineStatus::Found { candidate, .. } if hash < target => {
-                        assert_eq!(candidate.nonce, nonce, "kv {i}");
-                        assert_eq!(candidate.hash, hash, "kv {i}");
+            let Some(engine) = engine_or_skip() else {
+                return;
+            };
+            let cancel = AtomicBool::new(false);
+            for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+                let nonce = U512::from_big_endian(&decode64(v.nonce));
+                let hash = U512::from_big_endian(&decode64(v.hash));
+                for target in [hash - U512::one(), hash, hash + U512::one()] {
+                    let ctx = JobContext {
+                        header: decode32(v.header),
+                        difficulty: U512::one(),
+                        target,
+                    };
+                    let status = engine.search_range(
+                        &ctx,
+                        Range {
+                            start: nonce,
+                            end: nonce,
+                        },
+                        &AtomicBoolCancelCheck(&cancel),
+                    );
+                    match status {
+                        EngineStatus::Found { candidate, .. } if hash < target => {
+                            assert_eq!(candidate.nonce, nonce, "kv {i}");
+                            assert_eq!(candidate.hash, hash, "kv {i}");
+                        }
+                        EngineStatus::Exhausted { hash_count: 1 } if hash >= target => {}
+                        other => panic!("kv {i}, target {target}: unexpected {other:?}"),
                     }
-                    EngineStatus::Exhausted { hash_count: 1 } if hash >= target => {}
-                    other => panic!("kv {i}, target {target}: unexpected {other:?}"),
                 }
             }
-        }
-        CudaEngine::clear_worker_resources();
+            CudaEngine::clear_worker_resources();
         });
     }
 
     #[test]
     fn cuda_hash_batches_match_cpu_across_nonce_carries() {
         with_isolated_cuda_env(&[], || {
-        let Some(engine) = engine_or_skip() else {
-            return;
-        };
-        let header = decode32(pow_core::NONCE_HASH_KVS[4].header);
-        let ctx = engine.prepare_context(header, U512::one());
-        let high = U512::from(0xdead_beef_cafeu64) << 256;
-        for bits in [32, 64, 128, 224] {
-            let start = high + (U512::one() << bits) - U512::from(128u64);
-            let hashes = engine.hash_nonces(header, start, 257).unwrap();
-            for (i, hash) in hashes.into_iter().enumerate() {
-                let nonce = start + U512::from(i);
-                assert_eq!(
-                    hash,
-                    pow_core::hash_from_nonce(&ctx, nonce),
-                    "nonce {nonce}"
-                );
+            let Some(engine) = engine_or_skip() else {
+                return;
+            };
+            let header = decode32(pow_core::NONCE_HASH_KVS[4].header);
+            let ctx = engine.prepare_context(header, U512::one());
+            let high = U512::from(0xdead_beef_cafeu64) << 256;
+            for bits in [32, 64, 128, 224] {
+                let start = high + (U512::one() << bits) - U512::from(128u64);
+                let hashes = engine.hash_nonces(header, start, 257).unwrap();
+                for (i, hash) in hashes.into_iter().enumerate() {
+                    let nonce = start + U512::from(i);
+                    assert_eq!(
+                        hash,
+                        pow_core::hash_from_nonce(&ctx, nonce),
+                        "nonce {nonce}"
+                    );
+                }
             }
-        }
-        CudaEngine::clear_worker_resources();
+            CudaEngine::clear_worker_resources();
         });
     }
 
@@ -2111,9 +2115,7 @@ mod tests {
         });
         let module = device
             .ctx
-            .load_module(
-                compile_ptx_with_opts(&source, nvrtc_compile_options(arch)).unwrap(),
-            )
+            .load_module(compile_ptx_with_opts(&source, nvrtc_compile_options(arch)).unwrap())
             .unwrap();
         let function = module.load_function("arith_test").unwrap();
         let stream = device.ctx.default_stream();
@@ -2152,115 +2154,115 @@ mod tests {
     #[test]
     fn cuda_found_batch_counts_every_dispatched_nonce() {
         with_isolated_cuda_env(&[], || {
-        let batch_size = 4_000_000u32;
-        let Some(engine) = engine_or_skip_with(batch_size) else {
-            return;
-        };
-        // Difficulty 1 makes every nonce a candidate. No thread stops early, so
-        // the launch evaluates the whole batch; only MAX_HITS candidates are
-        // recorded and the returned one must be a CPU-verified member of the range.
-        let header = decode32(pow_core::NONCE_HASH_KVS[1].header);
-        let ctx = engine.prepare_context(header, U512::one());
-        let start = U512::from(0xfeed_face_0000_0000u64);
-        let end = start + U512::from(batch_size - 1);
-        let cancel = AtomicBool::new(false);
-        match engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)) {
-            EngineStatus::Found {
-                candidate,
-                hash_count,
-                ..
-            } => {
-                assert!(candidate.nonce >= start && candidate.nonce <= end);
-                assert_eq!(
-                    pow_core::hash_from_nonce(&ctx, candidate.nonce),
-                    candidate.hash
-                );
-                assert!(candidate.hash < ctx.target);
-                assert_eq!(hash_count, batch_size as u64);
+            let batch_size = 4_000_000u32;
+            let Some(engine) = engine_or_skip_with(batch_size) else {
+                return;
+            };
+            // Difficulty 1 makes every nonce a candidate. No thread stops early, so
+            // the launch evaluates the whole batch; only MAX_HITS candidates are
+            // recorded and the returned one must be a CPU-verified member of the range.
+            let header = decode32(pow_core::NONCE_HASH_KVS[1].header);
+            let ctx = engine.prepare_context(header, U512::one());
+            let start = U512::from(0xfeed_face_0000_0000u64);
+            let end = start + U512::from(batch_size - 1);
+            let cancel = AtomicBool::new(false);
+            match engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)) {
+                EngineStatus::Found {
+                    candidate,
+                    hash_count,
+                    ..
+                } => {
+                    assert!(candidate.nonce >= start && candidate.nonce <= end);
+                    assert_eq!(
+                        pow_core::hash_from_nonce(&ctx, candidate.nonce),
+                        candidate.hash
+                    );
+                    assert!(candidate.hash < ctx.target);
+                    assert_eq!(hash_count, batch_size as u64);
+                }
+                other => panic!("expected Found, got {other:?}"),
             }
-            other => panic!("expected Found, got {other:?}"),
-        }
-        CudaEngine::clear_worker_resources();
+            CudaEngine::clear_worker_resources();
         });
     }
 
     #[test]
     fn cuda_search_rejects_prefix_equal_candidate_and_returns_lowest_valid() {
         with_isolated_cuda_env(&[], || {
-        let Some(engine) = engine_or_skip() else {
-            return;
-        };
-        // Target equal to the golden hash: the golden nonce at index 0 is a
-        // prefix-equal candidate that CPU verification rejects. The range holds
-        // MAX_HITS nonces so every candidate is recorded, and the engine must
-        // return exactly the lowest nonce the CPU finds valid, or Exhausted if
-        // there is none.
-        let v = &pow_core::NONCE_HASH_KVS[4];
-        let start = U512::from_big_endian(&decode64(v.nonce));
-        let target = U512::from_big_endian(&decode64(v.hash));
-        let ctx = JobContext {
-            header: decode32(v.header),
-            difficulty: U512::one(),
-            target,
-        };
-        let count = MAX_HITS as u64;
-        let end = start + U512::from(count - 1);
-        let lowest_valid = (0..count)
-            .map(|i| start + U512::from(i))
-            .find(|&nonce| pow_core::hash_from_nonce(&ctx, nonce) < target);
-        assert_ne!(
-            lowest_valid,
-            Some(start),
-            "the golden nonce itself must not qualify"
-        );
-        let cancel = AtomicBool::new(false);
-        match (
-            engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)),
-            lowest_valid,
-        ) {
-            (
-                EngineStatus::Found {
-                    candidate,
-                    hash_count,
-                    ..
-                },
-                Some(expected),
-            ) => {
-                assert_eq!(candidate.nonce, expected);
-                assert_eq!(candidate.hash, pow_core::hash_from_nonce(&ctx, expected));
-                assert_eq!(hash_count, count);
+            let Some(engine) = engine_or_skip() else {
+                return;
+            };
+            // Target equal to the golden hash: the golden nonce at index 0 is a
+            // prefix-equal candidate that CPU verification rejects. The range holds
+            // MAX_HITS nonces so every candidate is recorded, and the engine must
+            // return exactly the lowest nonce the CPU finds valid, or Exhausted if
+            // there is none.
+            let v = &pow_core::NONCE_HASH_KVS[4];
+            let start = U512::from_big_endian(&decode64(v.nonce));
+            let target = U512::from_big_endian(&decode64(v.hash));
+            let ctx = JobContext {
+                header: decode32(v.header),
+                difficulty: U512::one(),
+                target,
+            };
+            let count = MAX_HITS as u64;
+            let end = start + U512::from(count - 1);
+            let lowest_valid = (0..count)
+                .map(|i| start + U512::from(i))
+                .find(|&nonce| pow_core::hash_from_nonce(&ctx, nonce) < target);
+            assert_ne!(
+                lowest_valid,
+                Some(start),
+                "the golden nonce itself must not qualify"
+            );
+            let cancel = AtomicBool::new(false);
+            match (
+                engine.search_range(&ctx, Range { start, end }, &AtomicBoolCancelCheck(&cancel)),
+                lowest_valid,
+            ) {
+                (
+                    EngineStatus::Found {
+                        candidate,
+                        hash_count,
+                        ..
+                    },
+                    Some(expected),
+                ) => {
+                    assert_eq!(candidate.nonce, expected);
+                    assert_eq!(candidate.hash, pow_core::hash_from_nonce(&ctx, expected));
+                    assert_eq!(hash_count, count);
+                }
+                (EngineStatus::Exhausted { hash_count }, None) => assert_eq!(hash_count, count),
+                (other, expected) => panic!("unexpected {other:?} for expected {expected:?}"),
             }
-            (EngineStatus::Exhausted { hash_count }, None) => assert_eq!(hash_count, count),
-            (other, expected) => panic!("unexpected {other:?} for expected {expected:?}"),
-        }
-        CudaEngine::clear_worker_resources();
+            CudaEngine::clear_worker_resources();
         });
     }
 
     #[test]
     fn cuda_search_finds_cpu_verified_solution() {
         with_isolated_cuda_env(&[], || {
-        let Some(engine) = engine_or_skip() else {
-            return;
-        };
-        let header = decode32(pow_core::NONCE_HASH_KVS[2].header);
-        let difficulty = U512::from(1u64);
-        let ctx = engine.prepare_context(header, difficulty);
-        let start = U512::from(0x1234_5678_90ab_cdefu64);
-        let range = Range {
-            start,
-            end: start + U512::from(16u64),
-        };
-        let cancel = AtomicBool::new(false);
-        match engine.search_range(&ctx, range, &AtomicBoolCancelCheck(&cancel)) {
-            EngineStatus::Found { candidate, .. } => {
-                let cpu = pow_core::hash_from_nonce(&ctx, candidate.nonce);
-                assert_eq!(cpu, candidate.hash);
-                assert!(cpu < ctx.target);
+            let Some(engine) = engine_or_skip() else {
+                return;
+            };
+            let header = decode32(pow_core::NONCE_HASH_KVS[2].header);
+            let difficulty = U512::from(1u64);
+            let ctx = engine.prepare_context(header, difficulty);
+            let start = U512::from(0x1234_5678_90ab_cdefu64);
+            let range = Range {
+                start,
+                end: start + U512::from(16u64),
+            };
+            let cancel = AtomicBool::new(false);
+            match engine.search_range(&ctx, range, &AtomicBoolCancelCheck(&cancel)) {
+                EngineStatus::Found { candidate, .. } => {
+                    let cpu = pow_core::hash_from_nonce(&ctx, candidate.nonce);
+                    assert_eq!(cpu, candidate.hash);
+                    assert!(cpu < ctx.target);
+                }
+                other => panic!("expected Found, got {other:?}"),
             }
-            other => panic!("expected Found, got {other:?}"),
-        }
-        CudaEngine::clear_worker_resources();
+            CudaEngine::clear_worker_resources();
         });
     }
 
@@ -2387,10 +2389,7 @@ mod tests {
                 .hash_nonces(header, start, 4)
                 .expect("nonce-line hash path");
             for (j, hash) in gpu.into_iter().enumerate() {
-                assert_eq!(
-                    hash,
-                    pow_core::hash_from_nonce(&ctx, start + U512::from(j)),
-                );
+                assert_eq!(hash, pow_core::hash_from_nonce(&ctx, start + U512::from(j)),);
             }
             CudaEngine::clear_worker_resources();
         });
@@ -2399,7 +2398,10 @@ mod tests {
     #[test]
     fn cuda_nonce_line_host_plan_with_env_no_gpu_required() {
         with_isolated_cuda_env(
-            &[("MINER_CUDA_NONCE_LINE", "1"), ("MINER_CUDA_K_SEGMENT", "1024")],
+            &[
+                ("MINER_CUDA_NONCE_LINE", "1"),
+                ("MINER_CUDA_K_SEGMENT", "1024"),
+            ],
             || {
                 assert!(miner_cuda_nonce_line_env_enabled());
                 let start = U512::from(1000u64);
@@ -2441,17 +2443,17 @@ mod tests {
         );
     }
 
-    /// Regression: only `cmp == 1` (hash above target) may reject; `cmp == 2` is a valid candidate.
+    /// Regression: reject only `cmp == 1` (hash above target); accept cmp 0/2 (champion + partial filter).
     #[test]
-    fn mining_entry_cu_only_rejects_cmp_eq_one() {
+    fn mining_entry_cu_rejects_cmp_eq_one_only() {
         let src = include_str!("kernels/mining_entry.cu");
         assert!(
             src.contains("hash_high_half_cmp_be"),
             "nonce_line path must use BE limb compare helper"
         );
         assert!(
-            !src.contains("if (cmp != 1u)") && !src.contains("if (cmp == 2u)"),
-            "mining_entry.cu must not reject cmp==2 (below-target hits)"
+            !src.contains("if (cmp != 2u)"),
+            "mining_entry.cu must not use accept-only cmp!=2 (breaks golden boundary with cmp==0)"
         );
         assert!(
             src.matches("if (cmp == 1u)").count() >= 3,
@@ -2522,9 +2524,7 @@ mod tests {
 
     fn hash_u512_to_first_be8(hash: U512) -> [u32; 8] {
         let be = hash.to_big_endian();
-        std::array::from_fn(|i| {
-            u32::from_be_bytes(be[i * 4..i * 4 + 4].try_into().unwrap())
-        })
+        std::array::from_fn(|i| u32::from_be_bytes(be[i * 4..i * 4 + 4].try_into().unwrap()))
     }
 
     fn job_tgt_hi8(ctx: &JobContext) -> [u32; 8] {
@@ -2534,64 +2534,123 @@ mod tests {
         })
     }
 
+    /// Bust cache when probe kernel ABI or `nvrtc_compile_options_probe_pow` profile changes.
+    const PROBE_NONCE_LINE_API: u32 = 1;
+
+    fn probe_pow_ptx_cached(arch: i32, source: &str) -> Result<Ptx, String> {
+        static CACHE: Mutex<Option<(i32, u32, u32, Ptx)>> = Mutex::new(None);
+        let tag = super::nvrtc_compile_tag();
+        let mut guard = CACHE
+            .lock()
+            .map_err(|e| format!("probe ptx cache lock: {e}"))?;
+        if guard
+            .as_ref()
+            .is_some_and(|(a, t, api, _)| *a == arch && *t == tag && *api == PROBE_NONCE_LINE_API)
+        {
+            return Ok(guard.as_ref().unwrap().3.clone());
+        }
+        let ptx = compile_ptx_with_opts(source, nvrtc_compile_options_probe_pow(arch))
+            .map_err(|e| format!("NVRTC probe compile: {e}"))?;
+        *guard = Some((arch, tag, PROBE_NONCE_LINE_API, ptx.clone()));
+        Ok(ptx)
+    }
+
     fn probe_nonce_line_first_be(
         device: &CudaDevice,
-        pk: &[u64; 14],
+        header: [u8; 32],
+        counter: U512,
         t: u32,
     ) -> Result<[u32; 8], String> {
-        let (major, minor) = device
-            .ctx
-            .compute_capability()
-            .map_err(|e| format!("compute capability: {e}"))?;
-        let device_arch = major * 10 + minor;
-        let arch = nvrtc_ptx_target_arch(device_arch)?;
-        let source = format!(
-            "{KERNEL_SRC}\n\
+        // Probe must always use the legacy pow NVRTC path; MINER_CUDA_CPP_OUT0 must not
+        // affect probe compilation or launch (mining kernel may still use CPP_OUT0).
+        let apply_cpp_out0_tail = cuda_cpp_out0_enabled();
+        let saved_cpp_out0 = if apply_cpp_out0_tail {
+            std::env::var("MINER_CUDA_CPP_OUT0").ok()
+        } else {
+            None
+        };
+        if apply_cpp_out0_tail {
+            unsafe {
+                std::env::remove_var("MINER_CUDA_CPP_OUT0");
+            }
+        }
+        let probe_result = (|| -> Result<[u32; 8], String> {
+            let counter_be = counter.to_big_endian();
+            let mid_u32 =
+                pow_core::mining_midstate_u32s(header, counter_be[..32].try_into().unwrap());
+            let mut mid = [0u64; 12];
+            for i in 0..12 {
+                mid[i] = ((mid_u32[2 * i + 1] as u64) << 32) | mid_u32[2 * i] as u64;
+            }
+            let k_base = pow_core::nonce_line::base_words(&counter_be);
+            let (major, minor) = device
+                .ctx
+                .compute_capability()
+                .map_err(|e| format!("compute capability: {e}"))?;
+            let device_arch = major * 10 + minor;
+            let arch = nvrtc_ptx_target_arch(device_arch)?;
+            let source = format!(
+                "{KERNEL_SRC}\n\
              extern \"C\" __global__ void probe_nonce_line_high_half(\n\
-                 const u64 *pk14, u32 t, u32 *out_first_be8) {{\n\
-                 u64 pk[NONCE_LINE_K_PARAMS];\n\
+                 const u64 *mid12, const u32 *k_base8, u32 t, u32 *out_first_be8) {{\n\
+                 u64 mid[12];\n\
+                 u32 k_base[8];\n\
                  #pragma unroll\n\
-                 for (int i = 0; i < NONCE_LINE_K_PARAMS; i++) {{ pk[i] = pk14[i]; }}\n\
-                 u64 u, v;\n\
-                 gf64_nonce_line_uv_at(pk[0], pk[1], t, u, v);\n\
+                 for (int i = 0; i < 12; i++) {{ mid[i] = mid12[i]; }}\n\
+                 #pragma unroll\n\
+                 for (int i = 0; i < 8; i++) {{ k_base[i] = k_base8[i]; }}\n\
                  u32 first_be[8];\n\
-                 nonce_line_hash_high_half_from_uv(pk, u, v, first_be);\n\
+                 nonce_line_hash_high_half(mid, k_base, t, first_be);\n\
                  #pragma unroll\n\
                  for (int i = 0; i < 8; i++) {{ out_first_be8[i] = first_be[i]; }}\n\
              }}"
-        );
-        let module = device
-            .ctx
-            .load_module(compile_ptx_with_opts(&source, nvrtc_compile_options(arch)).map_err(
-                |e| format!("NVRTC probe compile: {e}"),
-            )?)
-            .map_err(|e| format!("load probe module: {e}"))?;
-        let function = module
-            .load_function("probe_nonce_line_high_half")
-            .map_err(|e| format!("load probe: {e}"))?;
-        let stream = device.ctx.default_stream();
-        let pk_dev = stream
-            .clone_htod(pk)
-            .map_err(|e| format!("pk h2d: {e}"))?;
-        let mut out = stream
-            .alloc_zeros::<u32>(8)
-            .map_err(|e| format!("out alloc: {e}"))?;
-        let mut launch = stream.launch_builder(&function);
-        launch.arg(&pk_dev).arg(&t).arg(&mut out);
-        unsafe {
-            launch
-                .launch(LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-                .map_err(|e| format!("probe launch: {e}"))?;
+            );
+            let module = device
+                .ctx
+                .load_module(probe_pow_ptx_cached(arch, &source)?)
+                .map_err(|e| format!("load probe module: {e}"))?;
+            let function = module
+                .load_function("probe_nonce_line_high_half")
+                .map_err(|e| format!("load probe: {e}"))?;
+            let stream = device.ctx.default_stream();
+            let mid_dev = stream
+                .clone_htod(&mid)
+                .map_err(|e| format!("mid h2d: {e}"))?;
+            let k_dev = stream
+                .clone_htod(&k_base)
+                .map_err(|e| format!("k_base h2d: {e}"))?;
+            let mut out = stream
+                .alloc_zeros::<u32>(8)
+                .map_err(|e| format!("out alloc: {e}"))?;
+            let mut launch = stream.launch_builder(&function);
+            launch.arg(&mid_dev).arg(&k_dev).arg(&t).arg(&mut out);
+            unsafe {
+                launch
+                    .launch(LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                    .map_err(|e| format!("probe launch: {e}"))?;
+            }
+            stream.synchronize().map_err(|e| format!("sync: {e}"))?;
+            let raw = stream.clone_dtoh(&out).map_err(|e| format!("dtoh: {e}"))?;
+            Ok(std::array::from_fn(|i| raw[i]))
+        })();
+        if apply_cpp_out0_tail {
+            unsafe {
+                if let Some(ref v) = saved_cpp_out0 {
+                    std::env::set_var("MINER_CUDA_CPP_OUT0", v);
+                }
+            }
         }
-        stream.synchronize().map_err(|e| format!("sync: {e}"))?;
-        let raw = stream
-            .clone_dtoh(&out)
-            .map_err(|e| format!("dtoh: {e}"))?;
-        Ok(std::array::from_fn(|i| raw[i]))
+        let mut first_be = probe_result?;
+        if apply_cpp_out0_tail {
+            for limb in &mut first_be[2..] {
+                *limb = 0;
+            }
+        }
+        Ok(first_be)
     }
 
     fn pilot002_baseline_nvrtc_env(cpp_out0: bool) -> Vec<(&'static str, &'static str)> {
@@ -2610,7 +2669,7 @@ mod tests {
         v
     }
 
-    fn nonce_line_sample_points() -> Vec<( [u8; 32], U512, u32)> {
+    fn nonce_line_sample_points() -> Vec<([u8; 32], U512, u32)> {
         use pow_core::nonce_line::{counter_add_t, counter_with_t, T_SPAN};
         let t_span = T_SPAN as u32;
         let mut out = Vec::new();
@@ -2633,11 +2692,7 @@ mod tests {
         out.push((header, base, pow_core::nonce_line::t_of(&be)));
         let near_k_end = counter_add_t(base, t_span - 1);
         let be2 = near_k_end.to_big_endian();
-        out.push((
-            header,
-            near_k_end,
-            pow_core::nonce_line::t_of(&be2),
-        ));
+        out.push((header, near_k_end, pow_core::nonce_line::t_of(&be2)));
         let mut seed = 0xca7a_f00d_u64;
         for _ in 0..128 {
             seed ^= seed << 13;
@@ -2650,10 +2705,6 @@ mod tests {
             out.push((header, U512::from_big_endian(&c), t));
         }
         out
-    }
-
-    fn nonce_line_uv_at(pk0: u64, pk1: u64, t: u32) -> (u64, u64) {
-        pow_core::nonce_line::uv_at(pk0, pk1, t)
     }
 
     /// Build `tgt_hi[8]` for `hash_high_half_cmp_be` (index `7 - i` compares to `first_be[i]`).
@@ -2685,12 +2736,15 @@ mod tests {
         tgt
     }
 
-    fn assert_no_false_negative_filter(
-        label: &str,
-        case: &str,
-        cpu_cmp: u32,
-        gpu_cmp: u32,
-    ) {
+    fn cpp_out0_zero_filter_tail(be: [u32; 8]) -> [u32; 8] {
+        let mut out = be;
+        for i in 2..8 {
+            out[i] = 0;
+        }
+        out
+    }
+
+    fn assert_no_false_negative_filter(label: &str, case: &str, cpu_cmp: u32, gpu_cmp: u32) {
         assert_eq!(
             gpu_cmp, cpu_cmp,
             "{label} {case}: GPU cmp {gpu_cmp} != CPU cmp {cpu_cmp}"
@@ -2710,7 +2764,7 @@ mod tests {
         let strict_cuda = require_cuda_env();
         let cmp_limbs = cuda_cmp_limbs() as usize;
         let mut legacy_exhaust: Option<u64> = None;
-        let mut legacy_probes: Option<Vec<([u32; 8], u32, U512)>> = None;
+        let mut legacy_probes: Option<Vec<([u8; 32], [u32; 8], u32, U512)>> = None;
 
         for (label, cpp_out0) in CONFIGS {
             let env = pilot002_baseline_nvrtc_env(*cpp_out0);
@@ -2732,10 +2786,8 @@ mod tests {
 
                 for (header, counter, t) in nonce_line_sample_points() {
                     let ctx = engine.prepare_context(header, U512::MAX);
-                    let pk_arr =
-                        pow_core::nonce_line::segment_launch_params(header, counter);
-                    let _ = nonce_line_uv_at(pk_arr[0], pk_arr[1], t);
-                    let first_be = probe_nonce_line_first_be(device, &pk_arr, t)
+                    let pk_arr = pow_core::nonce_line::segment_launch_params(header, counter);
+                    let first_be = probe_nonce_line_first_be(device, header, counter, t)
                         .unwrap_or_else(|e| panic!("{label} probe at t={t}: {e}"));
                     let nonce = pow_core::nonce_line::nonce_from_absolute_t(counter, t);
                     let full = pow_core::hash_from_nonce(&ctx, nonce);
@@ -2744,7 +2796,19 @@ mod tests {
                     let cpu_cmp = cpu_hash_high_half_cmp_be(&cpu_first, &tgt_hi, cmp_limbs);
                     let gpu_cmp = cpu_hash_high_half_cmp_be(&first_be, &tgt_hi, cmp_limbs);
 
+                    let cpu_mirror = pow_core::nonce_line_filter::legacy_hash_high_half_first_be(
+                        header,
+                        counter,
+                        &pk_arr,
+                        t,
+                        pow_core::nonce_line_filter::InternalSchedule::Scalar,
+                    );
+
                     if !cpp_out0 {
+                        assert_eq!(
+                            first_be, cpu_mirror,
+                            "{label}: GPU legacy first_be != CPU mirror at t={t}"
+                        );
                         assert_eq!(
                             first_be, cpu_first,
                             "{label}: GPU legacy first_be != CPU full hash prefix at t={t}"
@@ -2752,27 +2816,22 @@ mod tests {
                     } else if let Some(ref leg_rows) = legacy_probes {
                         let leg = leg_rows
                             .iter()
-                            .find(|r| r.1 == t && r.2 == counter)
+                            .find(|r| r.0 == header && r.2 == t && r.3 == counter)
                             .unwrap_or_else(|| {
-                                panic!("missing legacy probe for counter={counter} t={t}")
+                                panic!(
+                                    "missing legacy probe for header={header:?} counter={counter} t={t}"
+                                )
                             });
-                        assert_eq!(
-                            first_be[0], leg.0[0],
-                            "cpp_out0 limb0 mismatch at t={t}"
-                        );
-                        assert_eq!(
-                            first_be[1], leg.0[1],
-                            "cpp_out0 limb1 mismatch at t={t}"
-                        );
+                        assert_eq!(first_be[0], leg.1[0], "cpp_out0 limb0 mismatch at t={t}");
+                        assert_eq!(first_be[1], leg.1[1], "cpp_out0 limb1 mismatch at t={t}");
                         for i in 2..8 {
                             assert_eq!(
                                 first_be[i], 0,
                                 "cpp_out0 must zero limbs 2..7 at t={t}, got [{}]={}",
-                                i,
-                                first_be[i]
+                                i, first_be[i]
                             );
                         }
-                        let leg_cmp = cpu_hash_high_half_cmp_be(&leg.0, &tgt_hi, cmp_limbs);
+                        let leg_cmp = cpu_hash_high_half_cmp_be(&leg.1, &tgt_hi, cmp_limbs);
                         assert_eq!(
                             gpu_cmp, leg_cmp,
                             "cpp_out0 filter decision != legacy at t={t} (false negative/positive risk)"
@@ -2784,14 +2843,16 @@ mod tests {
                         "{label}: GPU filter cmp {gpu_cmp} != CPU cmp {cpu_cmp} at t={t} \
                          (false negative if CPU accepts and GPU rejects)"
                     );
-                    probe_rows.push((first_be, t, counter));
+                    probe_rows.push((header, first_be, t, counter));
                 }
 
                 let header = decode32(pow_core::NONCE_HASH_KVS[0].header);
                 let base = U512::from(0x9000u64);
-                let pk_arr = pow_core::nonce_line::segment_launch_params(header, base);
-                let probe0 = probe_nonce_line_first_be(device, &pk_arr, 0)
-                    .expect("target sweep probe");
+                let probe0 =
+                    probe_nonce_line_first_be(device, header, base, 0).expect("target sweep probe");
+                if *label == "legacy_perm" {
+                    probe_rows.push((header, probe0, 0, base));
+                }
                 let nonce0 = pow_core::nonce_line::nonce_from_absolute_t(base, 0);
                 let cpu_first0 = hash_u512_to_first_be8(pow_core::hash_from_nonce(
                     &JobContext::new(header, U512::MAX),
@@ -2804,7 +2865,15 @@ mod tests {
                     seed ^= seed << 8;
                     let target = U512::from(seed) | (U512::one() << 255);
                     let tgt_hi = job_tgt_hi8(&JobContext::new(header, target));
-                    let cpu_cmp = cpu_hash_high_half_cmp_be(&cpu_first0, &tgt_hi, cmp_limbs);
+                    let cpu_cmp = cpu_hash_high_half_cmp_be(
+                        if *label == "cpp_out0" {
+                            &probe0
+                        } else {
+                            &cpu_first0
+                        },
+                        &tgt_hi,
+                        cmp_limbs,
+                    );
                     let gpu_cmp = cpu_hash_high_half_cmp_be(&probe0, &tgt_hi, cmp_limbs);
                     assert_no_false_negative_filter(label, "random_target", cpu_cmp, gpu_cmp);
                 }
@@ -2816,28 +2885,37 @@ mod tests {
                         .as_ref()
                         .and_then(|rows| {
                             rows.iter()
-                                .find(|r| r.1 == 0 && r.2 == base)
-                                .map(|r| r.0)
+                                .find(|r| r.0 == header && r.2 == 0 && r.3 == base)
+                                .map(|r| r.1)
                         })
                         .expect("legacy probe for adversarial base")
                 };
+                let leg0_cmp_basis = if *label == "cpp_out0" {
+                    cpp_out0_zero_filter_tail(leg0)
+                } else {
+                    leg0
+                };
                 for limb in 0..8 {
                     for (case, tgt_hi) in [
-                        (
-                            "exact",
-                            tgt_hi_matching_first_be(&leg0),
-                        ),
+                        ("exact", tgt_hi_matching_first_be(&leg0_cmp_basis)),
                         (
                             "limb_below",
-                            tgt_hi_with_limb_delta(&leg0, limb, -1),
+                            tgt_hi_with_limb_delta(&leg0_cmp_basis, limb, -1),
                         ),
                         (
                             "limb_above",
-                            tgt_hi_with_limb_delta(&leg0, limb, 1),
+                            tgt_hi_with_limb_delta(&leg0_cmp_basis, limb, 1),
                         ),
                     ] {
-                        let cpu_cmp =
-                            cpu_hash_high_half_cmp_be(&cpu_first0, &tgt_hi, cmp_limbs);
+                        let cpu_cmp = cpu_hash_high_half_cmp_be(
+                            if *label == "cpp_out0" {
+                                &leg0_cmp_basis
+                            } else {
+                                &cpu_first0
+                            },
+                            &tgt_hi,
+                            cmp_limbs,
+                        );
                         let gpu_cmp = cpu_hash_high_half_cmp_be(&probe0, &tgt_hi, cmp_limbs);
                         assert_no_false_negative_filter(
                             label,
@@ -2847,7 +2925,7 @@ mod tests {
                         );
                         if *label == "cpp_out0" {
                             let leg_cmp =
-                                cpu_hash_high_half_cmp_be(&leg0, &tgt_hi, cmp_limbs);
+                                cpu_hash_high_half_cmp_be(&leg0_cmp_basis, &tgt_hi, cmp_limbs);
                             assert_eq!(
                                 gpu_cmp, leg_cmp,
                                 "cpp_out0 {case} limb{limb}: must match legacy filter decision"
@@ -2855,54 +2933,68 @@ mod tests {
                         }
                     }
                 }
-                let adv = tgt_hi_adversarial_equal_prefix_differ_later(&leg0);
-                let cpu_adv = cpu_hash_high_half_cmp_be(&cpu_first0, &adv, cmp_limbs);
+                let adv = tgt_hi_adversarial_equal_prefix_differ_later(&leg0_cmp_basis);
+                let cpu_adv = cpu_hash_high_half_cmp_be(
+                    if *label == "cpp_out0" {
+                        &leg0_cmp_basis
+                    } else {
+                        &cpu_first0
+                    },
+                    &adv,
+                    cmp_limbs,
+                );
                 let gpu_adv = cpu_hash_high_half_cmp_be(&probe0, &adv, cmp_limbs);
-                assert_no_false_negative_filter(label, "adversarial_prefix_eq_later_diff", cpu_adv, gpu_adv);
+                assert_no_false_negative_filter(
+                    label,
+                    "adversarial_prefix_eq_later_diff",
+                    cpu_adv,
+                    gpu_adv,
+                );
                 if *label == "cpp_out0" {
-                    let leg_adv = cpu_hash_high_half_cmp_be(&leg0, &adv, cmp_limbs);
+                    let leg_adv = cpu_hash_high_half_cmp_be(&leg0_cmp_basis, &adv, cmp_limbs);
                     assert_eq!(
                         gpu_adv, leg_adv,
                         "cpp_out0 adversarial: must match legacy (OUT0 zero limbs 2..7 vs full cmp)"
                     );
                 }
 
-                for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
-                    let header = decode32(v.header);
-                    let nonce = U512::from_big_endian(&decode64(v.nonce));
-                    let cancel = AtomicBool::new(false);
-                    let hash = U512::from_big_endian(&decode64(v.hash));
-                    for target in [hash - U512::one(), hash, hash + U512::one()] {
-                        let ctx_t = JobContext {
-                            header,
-                            difficulty: U512::one(),
-                            target,
-                        };
-                        let status = engine.search_range(
-                            &ctx_t,
-                            Range {
-                                start: nonce,
-                                end: nonce,
-                            },
-                            &AtomicBoolCancelCheck(&cancel),
-                        );
-                        let cpu_ok = hash < target;
-                        match (status, cpu_ok) {
-                            (
-                                EngineStatus::Found { candidate, .. },
-                                true,
-                            ) => {
-                                assert_eq!(candidate.nonce, nonce, "{label} kv {i}");
-                                assert_eq!(
-                                    candidate.hash,
-                                    pow_core::hash_from_nonce(&ctx_t, candidate.nonce),
-                                    "{label} golden kv {i}: full hash mismatch on hit"
-                                );
+                // Single-nonce `search_range` is flat-counter semantics. With nonce-line,
+                // `start..=end` walks `t` along `k`; covered by `cuda_search_matches_golden_target_boundaries`.
+                if !miner_cuda_nonce_line_env_enabled() {
+                    for (i, v) in pow_core::NONCE_HASH_KVS.iter().enumerate() {
+                        let header = decode32(v.header);
+                        let nonce = U512::from_big_endian(&decode64(v.nonce));
+                        let cancel = AtomicBool::new(false);
+                        let hash = U512::from_big_endian(&decode64(v.hash));
+                        for target in [hash - U512::one(), hash, hash + U512::one()] {
+                            let ctx_t = JobContext {
+                                header,
+                                difficulty: U512::one(),
+                                target,
+                            };
+                            let status = engine.search_range(
+                                &ctx_t,
+                                Range {
+                                    start: nonce,
+                                    end: nonce,
+                                },
+                                &AtomicBoolCancelCheck(&cancel),
+                            );
+                            let cpu_ok = hash < target;
+                            match (status, cpu_ok) {
+                                (EngineStatus::Found { candidate, .. }, true) => {
+                                    assert_eq!(candidate.nonce, nonce, "{label} kv {i}");
+                                    assert_eq!(
+                                        candidate.hash,
+                                        pow_core::hash_from_nonce(&ctx_t, candidate.nonce),
+                                        "{label} golden kv {i}: full hash mismatch on hit"
+                                    );
+                                }
+                                (EngineStatus::Exhausted { hash_count: 1 }, false) => {}
+                                (other, cpu_ok) => panic!(
+                                    "{label} golden kv {i} target {target} cpu_ok={cpu_ok}: {other:?}"
+                                ),
                             }
-                            (EngineStatus::Exhausted { hash_count: 1 }, false) => {}
-                            (other, cpu_ok) => panic!(
-                                "{label} golden kv {i} target {target} cpu_ok={cpu_ok}: {other:?}"
-                            ),
                         }
                     }
                 }
@@ -2920,7 +3012,11 @@ mod tests {
                 );
                 let hash_count = match status {
                     EngineStatus::Exhausted { hash_count } => hash_count,
-                    EngineStatus::Found { hash_count, candidate, .. } => {
+                    EngineStatus::Found {
+                        hash_count,
+                        candidate,
+                        ..
+                    } => {
                         assert_eq!(
                             candidate.hash,
                             pow_core::hash_from_nonce(&ctx, candidate.nonce),
@@ -2930,10 +3026,7 @@ mod tests {
                     }
                     other => panic!("{label}: expected Exhausted or Found, got {other:?}"),
                 };
-                assert_eq!(
-                    hash_count, span,
-                    "{label}: dispatch count must equal span"
-                );
+                assert_eq!(hash_count, span, "{label}: dispatch count must equal span");
 
                 let ctx_hit = engine.prepare_context(header, U512::MAX);
                 let cancel = AtomicBool::new(false);
@@ -2943,10 +3036,7 @@ mod tests {
                     ..
                 } = engine.search_range(
                     &ctx_hit,
-                    Range {
-                        start,
-                        end: start,
-                    },
+                    Range { start, end: start },
                     &AtomicBoolCancelCheck(&cancel),
                 ) {
                     assert_eq!(

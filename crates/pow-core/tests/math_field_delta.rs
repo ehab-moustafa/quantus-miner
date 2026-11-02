@@ -100,10 +100,7 @@ fn math_field_delta_counts_1024_steps() {
         full.total(),
         incr.total()
     );
-    eprintln!(
-        "ratio mining_main inject only: {:.4}",
-        ratio_inject
-    );
+    eprintln!("ratio mining_main inject only: {:.4}", ratio_inject);
     eprintln!(
         "ratio nonce-line presbox imul-only: {:.4}",
         ratio_presbox_imul

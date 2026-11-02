@@ -262,6 +262,54 @@ __device__ __forceinline__ u64 gf64_sbox_after_sqr(u64 x, u64 x2) {
     return gf64_mul(x4, x3);
 }
 
+/* PoW-accurate permute (`pow_core::custom::permute_mut` / host scalar `permute64`). */
+__device__ __forceinline__ void pow_external_linear_layer(u64 *state) {
+    ext_layer64(state, RC_TERMINAL[4]);
+}
+
+__device__ __forceinline__ void pow_external_round(u64 *state, const u64 *rc12) {
+#pragma unroll
+    for (int i = 0; i < 12; i++) {
+        state[i] = gf64_add(state[i], rc12[i]);
+        state[i] = gf64_sbox(state[i]);
+    }
+    pow_external_linear_layer(state);
+}
+
+__device__ __forceinline__ void pow_internal_linear_layer(u64 *state) {
+    u64 sum = 0ULL;
+#pragma unroll
+    for (int i = 0; i < 12; i++) {
+        sum = gf64_add(sum, state[i]);
+    }
+#pragma unroll
+    for (int i = 0; i < 12; i++) {
+        state[i] = gf64_add(sum, gf64_mul(state[i], MDS_DIAG[i]));
+    }
+}
+
+__device__ __forceinline__ void pow_internal_round(u64 *state, u64 rc0) {
+    state[0] = gf64_add(state[0], rc0);
+    state[0] = gf64_sbox(state[0]);
+    pow_internal_linear_layer(state);
+}
+
+__device__ __forceinline__ void permute64_pow(u64 *state) {
+    pow_external_linear_layer(state);
+    pow_external_round(state, RC_INITIAL[0]);
+    pow_external_round(state, RC_INITIAL[1]);
+    pow_external_round(state, RC_INITIAL[2]);
+    pow_external_round(state, RC_INITIAL[3]);
+#pragma unroll 1
+    for (int r = 0; r < 22; r++) {
+        pow_internal_round(state, RC_INTERNAL[r]);
+    }
+    pow_external_round(state, RC_TERMINAL[0]);
+    pow_external_round(state, RC_TERMINAL[1]);
+    pow_external_round(state, RC_TERMINAL[2]);
+    pow_external_round(state, RC_TERMINAL[3]);
+}
+
 __device__ __forceinline__ void permute64_after_initial(u64 *state) {
     #pragma unroll 1
     for (int r = 0; r < 4; r++) {

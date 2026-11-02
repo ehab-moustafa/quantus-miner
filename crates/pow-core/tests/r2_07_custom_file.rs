@@ -198,7 +198,10 @@ fn time_fast_mul() -> f64 {
 }
 
 #[inline(never)]
-fn time_library_ext(states: &[[Goldilocks; SPONGE_WIDTH]], buf: &mut [[Goldilocks; SPONGE_WIDTH]]) -> f64 {
+fn time_library_ext(
+    states: &[[Goldilocks; SPONGE_WIDTH]],
+    buf: &mut [[Goldilocks; SPONGE_WIDTH]],
+) -> f64 {
     buf.copy_from_slice(states);
     black_box(buf.as_mut_ptr());
     let mut sink = 0u64;
@@ -212,7 +215,10 @@ fn time_library_ext(states: &[[Goldilocks; SPONGE_WIDTH]], buf: &mut [[Goldilock
 }
 
 #[inline(never)]
-fn time_custom_ext(states: &[[Goldilocks; SPONGE_WIDTH]], buf: &mut [[Goldilocks; SPONGE_WIDTH]]) -> f64 {
+fn time_custom_ext(
+    states: &[[Goldilocks; SPONGE_WIDTH]],
+    buf: &mut [[Goldilocks; SPONGE_WIDTH]],
+) -> f64 {
     buf.copy_from_slice(states);
     black_box(buf.as_mut_ptr());
     let mut sink = 0u64;
@@ -247,7 +253,11 @@ fn time_custom_perm(iters: u32) -> f64 {
     start.elapsed().as_nanos() as f64 / f64::from(iters)
 }
 
-fn paired_trials(n: usize, mut library: impl FnMut() -> f64, mut custom: impl FnMut() -> f64) -> (Vec<f64>, Vec<f64>) {
+fn paired_trials(
+    n: usize,
+    mut library: impl FnMut() -> f64,
+    mut custom: impl FnMut() -> f64,
+) -> (Vec<f64>, Vec<f64>) {
     let mut old = Vec::with_capacity(n);
     let mut new = Vec::with_capacity(n);
     for i in 0..n {
@@ -290,7 +300,10 @@ fn report(item: &str, mut old: Vec<f64>, mut new: Vec<f64>) {
         "{item} collapsed (old {old_med}, new {new_med}); timer loop was removed"
     );
     if item.contains("permute") || item.contains("whole") {
-        assert!(old_med < 20_000.0 && new_med < 20_000.0, "{item} unexpectedly slow");
+        assert!(
+            old_med < 20_000.0 && new_med < 20_000.0,
+            "{item} unexpectedly slow"
+        );
     }
 }
 
@@ -321,11 +334,21 @@ fn r2_07_custom_file() {
         core::array::from_fn(|i| Goldilocks::from_u64((i + 1) as u64));
     let mut library_seq = sequential;
     library_external_linear_layer(&mut library_seq);
-    let ext_expected = [144u64, 156, 168, 148, 172, 184, 196, 176, 200, 212, 224, 204];
-    assert_eq!(canon(&library_seq), ext_expected, "library external layer vector");
+    let ext_expected = [
+        144u64, 156, 168, 148, 172, 184, 196, 176, 200, 212, 224, 204,
+    ];
+    assert_eq!(
+        canon(&library_seq),
+        ext_expected,
+        "library external layer vector"
+    );
     let mut custom_seq = sequential;
     custom::external_linear_layer(&mut custom_seq);
-    assert_eq!(canon(&custom_seq), ext_expected, "custom external layer vector");
+    assert_eq!(
+        canon(&custom_seq),
+        ext_expected,
+        "custom external layer vector"
+    );
 
     assert_ext([Goldilocks::ZERO; SPONGE_WIDTH]);
     assert_ext([Goldilocks::new(1); SPONGE_WIDTH]);
@@ -339,14 +362,26 @@ fn r2_07_custom_file() {
     assert_eq!(canon(&zero), P3_ZERO_RESULT, "library permute zero vector");
     let mut custom_zero = [Goldilocks::ZERO; SPONGE_WIDTH];
     custom::permute_mut(&mut custom_zero);
-    assert_eq!(canon(&custom_zero), P3_ZERO_RESULT, "custom permute zero vector");
+    assert_eq!(
+        canon(&custom_zero),
+        P3_ZERO_RESULT,
+        "custom permute zero vector"
+    );
 
     let mut seq_perm = sequential;
     poseidon.permute_mut(&mut seq_perm);
-    assert_eq!(canon(&seq_perm), P3_SEQ_RESULT, "library permute sequential vector");
+    assert_eq!(
+        canon(&seq_perm),
+        P3_SEQ_RESULT,
+        "library permute sequential vector"
+    );
     let mut custom_seq_perm = sequential;
     custom::permute_mut(&mut custom_seq_perm);
-    assert_eq!(canon(&custom_seq_perm), P3_SEQ_RESULT, "custom permute sequential vector");
+    assert_eq!(
+        canon(&custom_seq_perm),
+        P3_SEQ_RESULT,
+        "custom permute sequential vector"
+    );
 
     let mut seed = 0xC0FFEE_u64;
     for _ in 0..64 {

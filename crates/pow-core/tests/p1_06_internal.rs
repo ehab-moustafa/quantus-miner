@@ -103,8 +103,9 @@ fn p1_06_internal_linear_parity_and_bench() {
     }
 
     const ITERS: u32 = 100_000;
-    let base: [Goldilocks; SPONGE_WIDTH] =
-        core::array::from_fn(|i| Goldilocks::from_u64(0x486dcb55419d475a_u64.wrapping_add(i as u64)));
+    let base: [Goldilocks; SPONGE_WIDTH] = core::array::from_fn(|i| {
+        Goldilocks::from_u64(0x486dcb55419d475a_u64.wrapping_add(i as u64))
+    });
     let mut acc = 0u64;
 
     let t0 = Instant::now();

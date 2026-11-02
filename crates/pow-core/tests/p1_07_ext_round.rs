@@ -101,10 +101,7 @@ fn fast_round(state: &mut [Goldilocks; SPONGE_WIDTH], rc: &[Goldilocks; SPONGE_W
     fast_external_linear_layer(state);
 }
 
-fn assert_round_pair(
-    mut state: [Goldilocks; SPONGE_WIDTH],
-    rc: [Goldilocks; SPONGE_WIDTH],
-) {
+fn assert_round_pair(mut state: [Goldilocks; SPONGE_WIDTH], rc: [Goldilocks; SPONGE_WIDTH]) {
     let mut reference = state;
     let mut fast = state;
     reference_round(&mut reference, &rc);
@@ -166,8 +163,9 @@ fn p1_07_external_round_parity_and_bench() {
     }
 
     const ITERS: u32 = 20_000;
-    let base: [Goldilocks; SPONGE_WIDTH] =
-        core::array::from_fn(|i| Goldilocks::from_u64(0x7d5c08eef608e382_u64.wrapping_add(i as u64)));
+    let base: [Goldilocks; SPONGE_WIDTH] = core::array::from_fn(|i| {
+        Goldilocks::from_u64(0x7d5c08eef608e382_u64.wrapping_add(i as u64))
+    });
     let rc = rc_table(2);
     let mut acc = 0u64;
 

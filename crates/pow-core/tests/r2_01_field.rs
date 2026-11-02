@@ -29,7 +29,11 @@ fn raw(g: Goldilocks) -> u64 {
 
 #[inline(always)]
 fn canon(x: u64) -> u64 {
-    if x >= P { x - P } else { x }
+    if x >= P {
+        x - P
+    } else {
+        x
+    }
 }
 
 fn xorshift(state: &mut u64) -> u64 {
@@ -140,7 +144,11 @@ fn add_cold(sum: u64) -> u64 {
 fn add_outline(x: u64, y: u64) -> u64 {
     let (sum, over) = x.overflowing_add(y);
     let (sum, over) = sum.overflowing_add(u64::from(over).wrapping_mul(NEG_ORDER));
-    if over { add_cold(sum) } else { sum }
+    if over {
+        add_cold(sum)
+    } else {
+        sum
+    }
 }
 
 #[inline(always)]
@@ -214,7 +222,11 @@ fn reduce_style(x: u128, shift: bool, fold: u8) -> u64 {
     let hi = (x >> 64) as u64;
     let t0 = t0_of(lo, hi >> 32);
     let hi_lo = hi & NEG_ORDER;
-    let t1 = if shift { limb_shift(hi_lo) } else { limb_mul(hi_lo) };
+    let t1 = if shift {
+        limb_shift(hi_lo)
+    } else {
+        limb_mul(hi_lo)
+    };
     match fold {
         0 => fold_mul(t0, t1),
         1 => fold_csel(t0, t1),
@@ -547,7 +559,11 @@ fn assert_canon(label: &str, got: u64, expect: u64) {
 fn prove_all() {
     assert_eq!(NEG_ORDER, 0xFFFF_FFFF);
     assert_eq!(core::mem::size_of::<Goldilocks>(), 8);
-    assert_eq!(Goldilocks::new(P).as_canonical_u64(), 0, "P must be 0 in-field");
+    assert_eq!(
+        Goldilocks::new(P).as_canonical_u64(),
+        0,
+        "P must be 0 in-field"
+    );
 
     // Published vector from the 3.1.0 unit tests.
     let a = 13_835_875_475_997_267_463u64;
@@ -590,7 +606,11 @@ fn prove_all() {
         let x = xorshift(&mut rng);
         let y = xorshift(&mut rng);
         let prod = u128::from(x) * u128::from(y);
-        assert_eq!(canon(lib_reduce(prod)), canon(lib_mul(x, y)), "reduce copy vs mul");
+        assert_eq!(
+            canon(lib_reduce(prod)),
+            canon(lib_mul(x, y)),
+            "reduce copy vs mul"
+        );
     }
 }
 
@@ -654,7 +674,11 @@ fn check_reduce(x: u128) {
     assert_canon("reduce plain", reduce_plain(x), expect);
     assert_canon("reduce csel", reduce_csel(x), expect);
     assert_canon("reduce shift", reduce_shift(x), expect);
-    assert_canon("reduce shift branchless", reduce_shift_branchless(x), expect);
+    assert_canon(
+        "reduce shift branchless",
+        reduce_shift_branchless(x),
+        expect,
+    );
     let _ = reduce_style(x, false, 0);
     #[cfg(target_arch = "aarch64")]
     assert_canon("reduce asm shift", reduce_asm_shift(x), expect);
@@ -732,7 +756,10 @@ fn finish(mut olds: Vec<f64>, mut news: Vec<f64>, ratios: &[f64]) -> Stats {
     }
 }
 
-fn measure_bin(mut old: impl FnMut(u64, u64) -> u64 + Copy, mut new: impl FnMut(u64, u64) -> u64 + Copy) -> Stats {
+fn measure_bin(
+    mut old: impl FnMut(u64, u64) -> u64 + Copy,
+    mut new: impl FnMut(u64, u64) -> u64 + Copy,
+) -> Stats {
     let _ = run_bin(&mut old, 200_000);
     let _ = run_bin(&mut new, 200_000);
     let mut olds = Vec::with_capacity(SAMPLES);
@@ -754,7 +781,10 @@ fn measure_bin(mut old: impl FnMut(u64, u64) -> u64 + Copy, mut new: impl FnMut(
     finish(olds, news, &ratios)
 }
 
-fn measure_unary(mut old: impl FnMut(u64) -> u64 + Copy, mut new: impl FnMut(u64) -> u64 + Copy) -> Stats {
+fn measure_unary(
+    mut old: impl FnMut(u64) -> u64 + Copy,
+    mut new: impl FnMut(u64) -> u64 + Copy,
+) -> Stats {
     let _ = run_unary(&mut old, 200_000);
     let _ = run_unary(&mut new, 200_000);
     let mut olds = Vec::with_capacity(SAMPLES);
@@ -776,7 +806,10 @@ fn measure_unary(mut old: impl FnMut(u64) -> u64 + Copy, mut new: impl FnMut(u64
     finish(olds, news, &ratios)
 }
 
-fn measure_red(mut old: impl FnMut(u128) -> u64 + Copy, mut new: impl FnMut(u128) -> u64 + Copy) -> Stats {
+fn measure_red(
+    mut old: impl FnMut(u128) -> u64 + Copy,
+    mut new: impl FnMut(u128) -> u64 + Copy,
+) -> Stats {
     let _ = run_red(&mut old, 200_000);
     let _ = run_red(&mut new, 200_000);
     let mut olds = Vec::with_capacity(SAMPLES);
@@ -873,8 +906,18 @@ fn r2_01_field() {
     let mut best = None;
     consider("add", "plain", &measure_bin(lib_add, add_plain), &mut best);
     consider("add", "csel", &measure_bin(lib_add, add_csel), &mut best);
-    consider("add", "branchless", &measure_bin(lib_add, add_branchless), &mut best);
-    consider("add", "outline", &measure_bin(lib_add, add_outline), &mut best);
+    consider(
+        "add",
+        "branchless",
+        &measure_bin(lib_add, add_branchless),
+        &mut best,
+    );
+    consider(
+        "add",
+        "outline",
+        &measure_bin(lib_add, add_outline),
+        &mut best,
+    );
     #[cfg(target_arch = "aarch64")]
     consider("add", "asm", &measure_bin(lib_add, add_asm), &mut best);
     let add_row = best;
@@ -882,7 +925,12 @@ fn r2_01_field() {
     let mut best = None;
     consider("sub", "plain", &measure_bin(lib_sub, sub_plain), &mut best);
     consider("sub", "csel", &measure_bin(lib_sub, sub_csel), &mut best);
-    consider("sub", "branchless", &measure_bin(lib_sub, sub_branchless), &mut best);
+    consider(
+        "sub",
+        "branchless",
+        &measure_bin(lib_sub, sub_branchless),
+        &mut best,
+    );
     #[cfg(target_arch = "aarch64")]
     consider("sub", "asm", &measure_bin(lib_sub, sub_asm), &mut best);
     let sub_row = best;
@@ -897,19 +945,54 @@ fn r2_01_field() {
         &measure_bin(lib_mul, mul_shift_branchless),
         &mut best,
     );
-    consider("mul", "fast_mul", &measure_bin(lib_mul, fast_mul), &mut best);
+    consider(
+        "mul",
+        "fast_mul",
+        &measure_bin(lib_mul, fast_mul),
+        &mut best,
+    );
     #[cfg(target_arch = "aarch64")]
     {
-        consider("mul", "asm-shift", &measure_bin(lib_mul, mul_asm_shift), &mut best);
-        consider("mul", "asm-mul", &measure_bin(lib_mul, mul_asm_mul), &mut best);
+        consider(
+            "mul",
+            "asm-shift",
+            &measure_bin(lib_mul, mul_asm_shift),
+            &mut best,
+        );
+        consider(
+            "mul",
+            "asm-mul",
+            &measure_bin(lib_mul, mul_asm_mul),
+            &mut best,
+        );
     }
     let mul_row = best;
 
     let mut best = None;
-    consider("square", "plain", &measure_unary(lib_square, square_plain), &mut best);
-    consider("square", "csel", &measure_unary(lib_square, square_csel), &mut best);
-    consider("square", "shift", &measure_unary(lib_square, square_shift), &mut best);
-    consider("square", "fast_mul", &measure_unary(lib_square, square_fast), &mut best);
+    consider(
+        "square",
+        "plain",
+        &measure_unary(lib_square, square_plain),
+        &mut best,
+    );
+    consider(
+        "square",
+        "csel",
+        &measure_unary(lib_square, square_csel),
+        &mut best,
+    );
+    consider(
+        "square",
+        "shift",
+        &measure_unary(lib_square, square_shift),
+        &mut best,
+    );
+    consider(
+        "square",
+        "fast_mul",
+        &measure_unary(lib_square, square_fast),
+        &mut best,
+    );
     consider(
         "square",
         "shift-branchless",
@@ -917,13 +1000,33 @@ fn r2_01_field() {
         &mut best,
     );
     #[cfg(target_arch = "aarch64")]
-    consider("square", "asm-shift", &measure_unary(lib_square, square_asm), &mut best);
+    consider(
+        "square",
+        "asm-shift",
+        &measure_unary(lib_square, square_asm),
+        &mut best,
+    );
     let square_row = best;
 
     let mut best = None;
-    consider("reduce128", "plain", &measure_red(lib_reduce, reduce_plain), &mut best);
-    consider("reduce128", "csel", &measure_red(lib_reduce, reduce_csel), &mut best);
-    consider("reduce128", "shift", &measure_red(lib_reduce, reduce_shift), &mut best);
+    consider(
+        "reduce128",
+        "plain",
+        &measure_red(lib_reduce, reduce_plain),
+        &mut best,
+    );
+    consider(
+        "reduce128",
+        "csel",
+        &measure_red(lib_reduce, reduce_csel),
+        &mut best,
+    );
+    consider(
+        "reduce128",
+        "shift",
+        &measure_red(lib_reduce, reduce_shift),
+        &mut best,
+    );
     consider(
         "reduce128",
         "shift-branchless",
@@ -940,10 +1043,30 @@ fn r2_01_field() {
     let reduce_row = best;
 
     let mut best = None;
-    consider("add+mul+square", "plain", &measure_bin(lib_pipe, group_plain), &mut best);
-    consider("add+mul+square", "csel", &measure_bin(lib_pipe, group_csel), &mut best);
-    consider("add+mul+square", "shift", &measure_bin(lib_pipe, group_shift), &mut best);
-    consider("add+mul+square", "fast", &measure_bin(lib_pipe, group_fast), &mut best);
+    consider(
+        "add+mul+square",
+        "plain",
+        &measure_bin(lib_pipe, group_plain),
+        &mut best,
+    );
+    consider(
+        "add+mul+square",
+        "csel",
+        &measure_bin(lib_pipe, group_csel),
+        &mut best,
+    );
+    consider(
+        "add+mul+square",
+        "shift",
+        &measure_bin(lib_pipe, group_shift),
+        &mut best,
+    );
+    consider(
+        "add+mul+square",
+        "fast",
+        &measure_bin(lib_pipe, group_fast),
+        &mut best,
+    );
     consider(
         "add+mul+square",
         "branchless",
@@ -951,7 +1074,12 @@ fn r2_01_field() {
         &mut best,
     );
     #[cfg(target_arch = "aarch64")]
-    consider("add+mul+square", "asm", &measure_bin(lib_pipe, group_asm), &mut best);
+    consider(
+        "add+mul+square",
+        "asm",
+        &measure_bin(lib_pipe, group_asm),
+        &mut best,
+    );
     let group_row = best;
 
     println!("TABLE");

@@ -68,7 +68,10 @@ fn external_linear_layer(state: &mut [Goldilocks; SPONGE_WIDTH]) {
 }
 
 #[inline(always)]
-fn internal_linear_layer(state: &mut [Goldilocks; SPONGE_WIDTH], matrix_diag: &[Goldilocks; SPONGE_WIDTH]) {
+fn internal_linear_layer(
+    state: &mut [Goldilocks; SPONGE_WIDTH],
+    matrix_diag: &[Goldilocks; SPONGE_WIDTH],
+) {
     let sum: Goldilocks = state.iter().copied().sum();
     for i in 0..SPONGE_WIDTH {
         state[i] = sum + state[i] * matrix_diag[i];

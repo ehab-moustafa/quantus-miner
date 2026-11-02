@@ -96,7 +96,9 @@ fn p1_05_external_linear_parity_and_bench() {
     let mut seq: [Goldilocks; SPONGE_WIDTH] =
         core::array::from_fn(|i| Goldilocks::from_u64((i + 1) as u64));
     external_linear_layer(&mut seq);
-    let expected = [144u64, 156, 168, 148, 172, 184, 196, 176, 200, 212, 224, 204];
+    let expected = [
+        144u64, 156, 168, 148, 172, 184, 196, 176, 200, 212, 224, 204,
+    ];
     assert_eq!(seq.map(|g| g.as_canonical_u64()), expected);
 
     let mut fast_seq: [Goldilocks; SPONGE_WIDTH] =
@@ -139,8 +141,9 @@ fn p1_05_external_linear_parity_and_bench() {
     }
 
     const ITERS: u32 = 100_000;
-    let base: [Goldilocks; SPONGE_WIDTH] =
-        core::array::from_fn(|i| Goldilocks::from_u64(0x486dcb55419d475a_u64.wrapping_add(i as u64)));
+    let base: [Goldilocks; SPONGE_WIDTH] = core::array::from_fn(|i| {
+        Goldilocks::from_u64(0x486dcb55419d475a_u64.wrapping_add(i as u64))
+    });
     let mut acc = 0u64;
 
     let t0 = Instant::now();

@@ -59,11 +59,10 @@ fn wide_add_wide(w: &mut Wide, x: Wide) {
     let (l1, c1b) = l1.overflowing_add(u32::from(c0));
     w.l0 = l0;
     w.l1 = l1;
-    w.h = w
-        .h
-        .wrapping_add(x.h)
-        .wrapping_add(u32::from(c1))
-        .wrapping_add(u32::from(c1b));
+    w.h =
+        w.h.wrapping_add(x.h)
+            .wrapping_add(u32::from(c1))
+            .wrapping_add(u32::from(c1b));
 }
 
 fn as_u128(w: Wide) -> u128 {

@@ -98,11 +98,7 @@ fn assert_fast_eq_goldilocks(a: u64, b: u64) {
         expect,
         "fast_mul({a}, {b})"
     );
-    assert_eq!(
-        Goldilocks::new(mul_old(a, b)),
-        expect,
-        "mul_old({a}, {b})"
-    );
+    assert_eq!(Goldilocks::new(mul_old(a, b)), expect, "mul_old({a}, {b})");
 }
 
 #[test]
@@ -133,7 +129,9 @@ fn p1_02_mul_parity_and_timing() {
     let mut x: u64 = 0xdead_beef_cafe_babe;
     for _ in 0..100_000 {
         let a = x;
-        x = x.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(0x517c_c1b7_2722_0a95);
+        x = x
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(0x517c_c1b7_2722_0a95);
         let b = x.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(a);
         assert_fast_eq_goldilocks(a, b);
     }

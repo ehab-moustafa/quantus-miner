@@ -130,15 +130,27 @@ fn assert_golden_and_custom_permutes(cases: &[KvCase]) {
         );
 
         let mid = mining_midstate(case.header, case.high);
-        assert_eq!(mid, canon(&fast2), "kv {i}: mining_midstate != its two permutes");
+        assert_eq!(
+            mid,
+            canon(&fast2),
+            "kv {i}: mining_midstate != its two permutes"
+        );
         assert_eq!(mid, kv.mid, "kv {i}: mining_midstate != stored mid");
 
         let direct = qpow_math::get_nonce_hash(case.header, case.nonce_be);
         let via_ctx = hash_from_nonce(&case.ctx, case.nonce);
         let resumed = resume_full_hash(case.header, case.nonce_be);
         let want = decode64(kv.hash);
-        assert_eq!(direct.to_big_endian(), want, "kv {i}: get_nonce_hash != stored hash");
-        assert_eq!(via_ctx.to_big_endian(), want, "kv {i}: hash_from_nonce != stored hash");
+        assert_eq!(
+            direct.to_big_endian(),
+            want,
+            "kv {i}: get_nonce_hash != stored hash"
+        );
+        assert_eq!(
+            via_ctx.to_big_endian(),
+            want,
+            "kv {i}: hash_from_nonce != stored hash"
+        );
         assert_eq!(resumed, direct, "kv {i}: midstate resume != get_nonce_hash");
         assert_eq!(via_ctx, direct, "kv {i}: hash_from_nonce != get_nonce_hash");
     }
@@ -201,7 +213,8 @@ fn bench_kvs(cases: &[KvCase]) -> Times {
         let t2 = Instant::now();
         for _ in 0..REPS {
             for case in cases {
-                let got = qpow_math::get_nonce_hash(black_box(case.header), black_box(case.nonce_be));
+                let got =
+                    qpow_math::get_nonce_hash(black_box(case.header), black_box(case.nonce_be));
                 sink ^= black_box(got.low_u64());
             }
         }
@@ -289,7 +302,11 @@ fn walk_uv(pk0: u64, pk1: u64, base: u32, len: u32) -> u64 {
 }
 
 fn assert_uv_step_matches_rebuild() {
-    let full = [(0u64, 0u64), (P64 - 1, 1), (0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210)];
+    let full = [
+        (0u64, 0u64),
+        (P64 - 1, 1),
+        (0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210),
+    ];
     let mut acc = 0u64;
     for (pk0, pk1) in full {
         acc ^= walk_uv(pk0, pk1, 0, T_SPAN);
@@ -328,7 +345,10 @@ fn assert_uv_step_matches_rebuild() {
     // One step past u32::MAX stays on the u64 recurrence and leaves the wrapped formula.
     let pk0 = 0x1111_2222_3333_4444u64;
     let pk1 = 0x5555_6666_7777_8888u64;
-    let (u, v) = step_uv(u_at(pk0, u64::from(u32::MAX)), v_at(pk1, u64::from(u32::MAX)));
+    let (u, v) = step_uv(
+        u_at(pk0, u64::from(u32::MAX)),
+        v_at(pk1, u64::from(u32::MAX)),
+    );
     assert_eq!(u, u_at(pk0, u64::from(u32::MAX) + 1));
     assert_eq!(v, v_at(pk1, u64::from(u32::MAX) + 1));
     assert_ne!(u, u_at(pk0, 0));
@@ -381,11 +401,10 @@ fn wide_add_wide(w: &mut Wide, x: Wide) {
     let (l1, c1b) = l1.overflowing_add(u32::from(c0));
     w.l0 = l0;
     w.l1 = l1;
-    w.h = w
-        .h
-        .wrapping_add(x.h)
-        .wrapping_add(u32::from(c1))
-        .wrapping_add(u32::from(c1b));
+    w.h =
+        w.h.wrapping_add(x.h)
+            .wrapping_add(u32::from(c1))
+            .wrapping_add(u32::from(c1b));
 }
 
 fn as_u128(w: Wide) -> u128 {
@@ -531,8 +550,16 @@ fn assert_column_sums_match() {
         let folded = field_mat4(lanes[0], lanes[1], lanes[2], lanes[3]);
         for lane in 0..4 {
             let wide_mod = (as_u128(new[lane]) % P128) as u64;
-            assert_eq!(wide_mod, summed[lane].as_canonical_u64(), "mod p sum state {n}");
-            assert_eq!(wide_mod, folded[lane].as_canonical_u64(), "mod p fold state {n}");
+            assert_eq!(
+                wide_mod,
+                summed[lane].as_canonical_u64(),
+                "mod p sum state {n}"
+            );
+            assert_eq!(
+                wide_mod,
+                folded[lane].as_canonical_u64(),
+                "mod p fold state {n}"
+            );
         }
     }
     let n = states.len() as u64;
@@ -669,10 +696,7 @@ fn assert_op_counts() {
     assert_eq!(old_uv.gf64_add, 2000);
     assert_eq!(new_uv_adds, 2002);
 
-    println!(
-        "R2_10_OPS flat_n1 adds {} m4 {}",
-        flat1.gf64_add, flat1.m4
-    );
+    println!("R2_10_OPS flat_n1 adds {} m4 {}", flat1.gf64_add, flat1.m4);
     println!(
         "R2_10_OPS line_n1 adds {} m4 {} imul {}",
         line1.gf64_add, line1.m4, line1.imul
@@ -685,7 +709,10 @@ fn assert_op_counts() {
         "R2_10_OPS line_n1000 adds {} m4 {} imul {}",
         line1000.gf64_add, line1000.m4, line1000.imul
     );
-    println!("R2_10_OPS uv_rebuild_n1000 adds {} imul {}", old_uv.gf64_add, old_uv.imul);
+    println!(
+        "R2_10_OPS uv_rebuild_n1000 adds {} imul {}",
+        old_uv.gf64_add, old_uv.imul
+    );
     println!("R2_10_OPS uv_step_n1000 adds {new_uv_adds} imul 1");
 }
 
@@ -704,8 +731,14 @@ fn r2_10_cross() {
     let times = bench_kvs(&cases);
     println!("R2_10_TIME permute_pair_ns {:.1}", times.permute_pair_ns);
     println!("R2_10_TIME mining_midstate_ns {:.1}", times.midstate_ns);
-    println!("R2_10_TIME get_nonce_hash_ns {:.1}", times.get_nonce_hash_ns);
-    println!("R2_10_TIME hash_from_nonce_ns {:.1}", times.hash_from_nonce_ns);
+    println!(
+        "R2_10_TIME get_nonce_hash_ns {:.1}",
+        times.get_nonce_hash_ns
+    );
+    println!(
+        "R2_10_TIME hash_from_nonce_ns {:.1}",
+        times.hash_from_nonce_ns
+    );
     println!(
         "R2_10_TIME ratio_get {:.4} ratio_hash {:.4} ratio_mid {:.4}",
         times.get_nonce_hash_ns / times.permute_pair_ns,

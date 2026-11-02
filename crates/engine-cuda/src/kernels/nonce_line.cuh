@@ -5,18 +5,26 @@
  *
  * Walk w = B(k) + t*v so M_ext*v is zero except lanes 0 and 4. Round 1 needs two
  * S-boxes; the other ten lanes fold into pk[14] per k (launch_params).
+ *
+ * Hash dispatch (merge M3):
+ *   MINER_CUDA_CPP_OUT0 unset/0 — pow-oracle path (midstate + permute64_pow) for G0A tests.
+ *   MINER_CUDA_CPP_OUT0=1       — UV round-1 + cpp_out0.cuh out0 schedule (T-123 champion).
  */
 
 #pragma once
+
+#if defined(MINER_CUDA_CPP_OUT0)
+#include "cpp_out0.cuh"
+#endif
 
 #define NONCE_LINE_K_T_BITS 26
 #define NONCE_LINE_K_PARAMS 14
 
 #ifndef MINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL
-#define MINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL 0
+#define MINER_CUDA_NONCE_LINE_EXT_SBOX_UNROLL 1
 #endif
 #ifndef MINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL
-#define MINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL 0
+#define MINER_CUDA_NONCE_LINE_TERM_EXT_UNROLL 1
 #endif
 
 __device__ __constant__ int NONCE_LINE_K_V[8] = {4, -17, 11, -3, -4, 17, -11, 3};
@@ -192,24 +200,11 @@ __device__ __forceinline__ void nonce_line_permute_from_round1(u64 *state) {
     nonce_line_external_round(state, RC_INITIAL[2]);
     nonce_line_external_round(state, RC_INITIAL[3]);
     u64 x = gf64_sbox(gf64_add(state[0], RC_INTERNAL[0]));
-#if (defined(MINER_CUDA_PIPE_SBOX) && MINER_CUDA_PIPE_SBOX) || \
-    (defined(MINER_CUDA_NONCE_LINE_PIPE) && MINER_CUDA_NONCE_LINE_PIPE)
-#ifndef MINER_CUDA_INTERNAL_UNROLL
-#define MINER_CUDA_INTERNAL_UNROLL 1
-#endif
-#pragma unroll MINER_CUDA_INTERNAL_UNROLL
-    for (int r = 0; r < 21; r++) {
-        u64 out0 = int_round_head(state, x, RC_INTERNAL[r + 1]);
-        u64 x2 = gf64_sqr(out0);
-        int_round_tail(state, x);
-        x = gf64_sbox_after_sqr(out0, x2);
-    }
-#else
+    /* PILOT-002 G0-A: piped internal rounds here diverged from scalar `int_round_p` vs full hash prefix. */
 #pragma unroll 1
     for (int r = 0; r < 21; r++) {
         x = gf64_sbox(int_round_p(state, x, RC_INTERNAL[r + 1]));
     }
-#endif
     state[0] = int_round_p(state, x, 0ULL);
 #pragma unroll
     for (int i = 0; i < 12; i++) {
@@ -218,32 +213,17 @@ __device__ __forceinline__ void nonce_line_permute_from_round1(u64 *state) {
     nonce_line_terminal_external_rounds(state);
 }
 
-__device__ __forceinline__ void nonce_line_hash_high_half_from_uv(const u64 pk[NONCE_LINE_K_PARAMS],
-                                                                  u64 u, u64 v, u32 *first_be) {
-#if defined(MINER_CUDA_CPP_OUT0)
-    u64 st[12];
-    nonce_line_round1_state_from_uv(pk, u, v, st);
-    cpp_out0_second_permute_loops(st);
-    const u64 o = cpp_out0_ext_row0_canon(st);
-    u32 first[8];
+__device__ __forceinline__ void nonce_line_absorb_mapped_low(u64 *state, const u32 k_base[8],
+                                                             u32 t) {
 #pragma unroll
     for (int i = 0; i < 8; i++) {
-        first[i] = 0u;
+        const int vi = NONCE_LINE_K_V[i];
+        const u32 w = k_base[i] + (u32)((long long)vi * (long long)t);
+        state[i] = gf64_add(state[i], (u64)w);
     }
-    u64 c = gf64_canon(o);
-    first[0] = (u32)(c & EPS64);
-    first[1] = (u32)(c >> 32);
-#pragma unroll
-    for (int i = 0; i < 8; i++) {
-        first_be[i] = bswap32(first[i]);
-    }
-#else
-    u64 st[12];
-    nonce_line_round1_state_from_uv(pk, u, v, st);
-    nonce_line_permute_from_round1(st);
-    st[0] = gf64_add(st[0], 1ULL);
-    st[1] = gf64_add(st[1], 1ULL);
-    permute64(st);
+}
+
+__device__ __forceinline__ void nonce_line_pack_first_be8(const u64 st[12], u32 *first_be) {
     u32 first[8];
 #pragma unroll
     for (int i = 0; i < 4; i++) {
@@ -255,12 +235,81 @@ __device__ __forceinline__ void nonce_line_hash_high_half_from_uv(const u64 pk[N
     for (int i = 0; i < 8; i++) {
         first_be[i] = bswap32(first[i]);
     }
+}
+
+#if defined(MINER_CUDA_CPP_OUT0)
+/* V2_OUT0 filter shape: BE limbs 0..1 from out0 row0; limbs 2..7 zero. */
+__device__ __forceinline__ void nonce_line_pack_cpp_out0_first_be8(u64 out0_canon, u32 *first_be) {
+    u32 first[8];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        first[i] = 0u;
+    }
+    u64 c = gf64_canon(out0_canon);
+    first[0] = (u32)(c & EPS64);
+    first[1] = (u32)(c >> 32);
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        first_be[i] = bswap32(first[i]);
+    }
+}
+#endif
+
+/* Host mirror: `goldilocks_state_after_third_permute` + capacity + scalar permute. */
+__device__ __forceinline__ void nonce_line_hash_high_half_pow(const u64 mid[12],
+                                                              const u32 k_base[8], u32 t,
+                                                              u32 *first_be) {
+    u64 st[12];
+#pragma unroll
+    for (int i = 0; i < 12; i++) {
+        st[i] = mid[i];
+    }
+    nonce_line_absorb_mapped_low(st, k_base, t);
+    permute64_pow(st);
+    st[0] = gf64_add(st[0], 1ULL);
+    st[1] = gf64_add(st[1], 1ULL);
+    permute64_pow(st);
+    nonce_line_pack_first_be8(st, first_be);
+}
+
+__device__ __forceinline__ void nonce_line_load_mid_from_prestate(const u32 prestate[24],
+                                                                  u64 mid[12]) {
+#pragma unroll
+    for (int i = 0; i < 12; i++) {
+        mid[i] = ((u64)prestate[2 * i + 1] << 32) | (u64)prestate[2 * i];
+    }
+}
+
+__device__ __forceinline__ void nonce_line_hash_high_half_from_uv(const u64 pk[NONCE_LINE_K_PARAMS],
+                                                                  u64 u, u64 v, const u64 mid[12],
+                                                                  const u32 k_base[8], u32 t,
+                                                                  u32 *first_be) {
+#if defined(MINER_CUDA_CPP_OUT0)
+    (void)mid;
+    (void)k_base;
+    (void)t;
+    u64 st[12];
+    nonce_line_round1_state_from_uv(pk, u, v, st);
+    cpp_out0_second_permute_loops(st);
+    const u64 o = cpp_out0_ext_row0_canon(st);
+    nonce_line_pack_cpp_out0_first_be8(o, first_be);
+#else
+    (void)pk;
+    (void)u;
+    (void)v;
+    nonce_line_hash_high_half_pow(mid, k_base, t, first_be);
 #endif
 }
 
-__device__ __forceinline__ void nonce_line_hash_high_half(const u64 pk[NONCE_LINE_K_PARAMS], u32 t,
-                                                          u32 *first_be) {
-    u64 u, v;
-    gf64_nonce_line_uv_at(pk[0], pk[1], t, u, v);
-    nonce_line_hash_high_half_from_uv(pk, u, v, first_be);
+__device__ __forceinline__ void nonce_line_hash_high_half_from_uv_prestate(
+    const u64 pk[NONCE_LINE_K_PARAMS], u64 u, u64 v, const u32 prestate[24],
+    const u32 k_base[8], u32 t, u32 *first_be) {
+    u64 mid[12];
+    nonce_line_load_mid_from_prestate(prestate, mid);
+    nonce_line_hash_high_half_from_uv(pk, u, v, mid, k_base, t, first_be);
+}
+
+__device__ __forceinline__ void nonce_line_hash_high_half(const u64 mid[12], const u32 k_base[8],
+                                                          u32 t, u32 *first_be) {
+    nonce_line_hash_high_half_pow(mid, k_base, t, first_be);
 }

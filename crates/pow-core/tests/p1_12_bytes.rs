@@ -149,8 +149,18 @@ fn assert_u64s_match_lib(input: &[u8]) {
     let lib = bytes_to_u64s(input);
     let old = bytes_to_u64s_old(input);
     let fast = bytes_to_u64s_fast(input);
-    assert_eq!(lib, old, "old iter diverged from library (len {})", input.len());
-    assert_eq!(lib, fast, "fast diverged from library (len {})", input.len());
+    assert_eq!(
+        lib,
+        old,
+        "old iter diverged from library (len {})",
+        input.len()
+    );
+    assert_eq!(
+        lib,
+        fast,
+        "fast diverged from library (len {})",
+        input.len()
+    );
 
     let lib_f = bytes_to_felts(input);
     let old_f = bytes_to_felts_old(input);
@@ -192,10 +202,7 @@ fn p1_12_bytes_parity_and_bench() {
     for _ in 0..10_000 {
         let b32 = random_bytes32(&mut rng);
         assert_u64s_match_lib(&b32);
-        assert_eq!(
-            bytes_to_u64s_32_fast(&b32).as_slice(),
-            bytes_to_u64s(&b32)
-        );
+        assert_eq!(bytes_to_u64s_32_fast(&b32).as_slice(), bytes_to_u64s(&b32));
 
         let header_old = header_absorb_u64s_old(&b32);
         let header_fast = header_absorb_u64s_fast(&b32);
@@ -203,10 +210,7 @@ fn p1_12_bytes_parity_and_bench() {
 
         let b64 = random_bytes64(&mut rng);
         assert_u64s_match_lib(&b64);
-        assert_eq!(
-            bytes_to_u64s_64_fast(&b64).as_slice(),
-            bytes_to_u64s(&b64)
-        );
+        assert_eq!(bytes_to_u64s_64_fast(&b64).as_slice(), bytes_to_u64s(&b64));
     }
 
     const ITERS: u32 = 200_000;

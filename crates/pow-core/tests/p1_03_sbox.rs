@@ -34,7 +34,12 @@ fn fast_sbox(x: Goldilocks) -> Goldilocks {
 fn assert_sbox_pair(x: Goldilocks) {
     let y = old_sbox(x);
     assert_eq!(ref_exp7(x), y, "ref_exp7 diverged from library for {x:?}");
-    assert_eq!(fast_sbox(x), y, "fast_sbox diverged for input {}", x.as_canonical_u64());
+    assert_eq!(
+        fast_sbox(x),
+        y,
+        "fast_sbox diverged for input {}",
+        x.as_canonical_u64()
+    );
 }
 
 #[test]

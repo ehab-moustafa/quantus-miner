@@ -107,11 +107,7 @@ fn library_external_linear_layer(state: &mut [Goldilocks; SPONGE_WIDTH]) {
     }
 }
 
-fn library_midstate(
-    poseidon: &Poseidon2,
-    header: [u8; 32],
-    high: [u8; 32],
-) -> [u64; SPONGE_WIDTH] {
+fn library_midstate(poseidon: &Poseidon2, header: [u8; 32], high: [u8; 32]) -> [u64; SPONGE_WIDTH] {
     let mut state = [Goldilocks::ZERO; SPONGE_WIDTH];
     absorb_u32s(&mut state, &header);
     poseidon.permute_mut(&mut state);
@@ -147,7 +143,10 @@ fn pack24(felts: &[u64; SPONGE_WIDTH]) -> [u32; 24] {
 fn assert_case_matches_library(poseidon: &Poseidon2, case: &Case, label: &str) {
     let mid = mining_midstate(case.header, case.high);
     let lib_mid = library_midstate(poseidon, case.header, case.high);
-    assert_eq!(mid, lib_mid, "{label}: mining_midstate != library two-permute");
+    assert_eq!(
+        mid, lib_mid,
+        "{label}: mining_midstate != library two-permute"
+    );
 
     let pre = mining_prestate_low64(case.header, case.nonce_be);
     let lib_pre = library_prestate(poseidon, case.header, case.nonce_be);

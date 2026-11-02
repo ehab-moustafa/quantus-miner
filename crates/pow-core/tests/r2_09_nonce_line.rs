@@ -362,9 +362,7 @@ fn assert_round_trip(header: [u8; 32], sample: &Sample) {
 }
 
 #[inline(always)]
-fn path_old(
-    sample: &Sample,
-) -> ([u32; 8], u32, [u64; K_PARAMS], U512) {
+fn path_old(sample: &Sample) -> ([u32; 8], u32, [u64; K_PARAMS], U512) {
     let b = base_words(&sample.be);
     let t = t_of(&sample.be);
     let pk = launch_params(&sample.mid, &sample.be);
@@ -373,9 +371,7 @@ fn path_old(
 }
 
 #[inline(always)]
-fn path_fast(
-    sample: &Sample,
-) -> ([u32; 8], u32, [u64; K_PARAMS], U512) {
+fn path_fast(sample: &Sample) -> ([u32; 8], u32, [u64; K_PARAMS], U512) {
     let b = base_words_fast(&sample.be);
     let t = t_of_fast(&sample.be);
     let pk = launch_params_from_words(&sample.mid, b);
@@ -714,15 +710,51 @@ fn r2_09_nonce_line_parity_and_bench() {
     });
 
     print_table(&[
-        Row { item: "t_of", old_ns: t_old, new_ns: t_new },
-        Row { item: "k_of", old_ns: k_old, new_ns: k_new },
-        Row { item: "base_words", old_ns: b_old, new_ns: b_new },
-        Row { item: "map_counter", old_ns: m_old, new_ns: m_new },
-        Row { item: "launch_params", old_ns: l_old, new_ns: l_new },
-        Row { item: "segment_launch_params", old_ns: s_old, new_ns: s_new },
-        Row { item: "counter_add_t", old_ns: a_old, new_ns: a_new },
-        Row { item: "nonce_from_absolute_t", old_ns: n_old, new_ns: n_new },
-        Row { item: "t_room_in_k", old_ns: r_old, new_ns: r_new },
+        Row {
+            item: "t_of",
+            old_ns: t_old,
+            new_ns: t_new,
+        },
+        Row {
+            item: "k_of",
+            old_ns: k_old,
+            new_ns: k_new,
+        },
+        Row {
+            item: "base_words",
+            old_ns: b_old,
+            new_ns: b_new,
+        },
+        Row {
+            item: "map_counter",
+            old_ns: m_old,
+            new_ns: m_new,
+        },
+        Row {
+            item: "launch_params",
+            old_ns: l_old,
+            new_ns: l_new,
+        },
+        Row {
+            item: "segment_launch_params",
+            old_ns: s_old,
+            new_ns: s_new,
+        },
+        Row {
+            item: "counter_add_t",
+            old_ns: a_old,
+            new_ns: a_new,
+        },
+        Row {
+            item: "nonce_from_absolute_t",
+            old_ns: n_old,
+            new_ns: n_new,
+        },
+        Row {
+            item: "t_room_in_k",
+            old_ns: r_old,
+            new_ns: r_new,
+        },
         Row {
             item: "full path",
             old_ns: p_old,

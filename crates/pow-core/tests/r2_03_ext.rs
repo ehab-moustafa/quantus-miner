@@ -399,7 +399,12 @@ fn report(item: &str, old: [f64; TRIALS], new: [f64; TRIALS]) {
 fn r2_03_ext_parity_and_bench() {
     check_mat4([Goldilocks::ZERO; 4]);
     check_mat4([Goldilocks::ONE; 4]);
-    let known4 = [Goldilocks::new(1), Goldilocks::new(2), Goldilocks::new(3), Goldilocks::new(4)];
+    let known4 = [
+        Goldilocks::new(1),
+        Goldilocks::new(2),
+        Goldilocks::new(3),
+        Goldilocks::new(4),
+    ];
     check_mat4(known4);
     let mut known4_lib = known4;
     lib_apply_mat4(&mut known4_lib);
@@ -424,10 +429,14 @@ fn r2_03_ext_parity_and_bench() {
 
     let mut rng = 0x3141_5926_5358_9793_u64;
     for _ in 0..50_000 {
-        check_mat4(core::array::from_fn(|_| Goldilocks::new(xorshift(&mut rng))));
+        check_mat4(core::array::from_fn(|_| {
+            Goldilocks::new(xorshift(&mut rng))
+        }));
     }
     for _ in 0..20_000 {
-        check_ext(core::array::from_fn(|_| Goldilocks::new(xorshift(&mut rng))));
+        check_ext(core::array::from_fn(|_| {
+            Goldilocks::new(xorshift(&mut rng))
+        }));
     }
     println!("ASSERTS passed (random, all-zero, all-one, edges, known vectors)");
 
